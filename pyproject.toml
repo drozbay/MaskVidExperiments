@@ -1,0 +1,14 @@
+[project]
+name = "maskvidexperiments"
+description = "Video masking tools for ComfyUI: jitter-free subject-tracked crop and uncrop with feathered mask-confined pasting, video mask cleanup, and pixel-to-latent mask reduction aligned to causal video VAE frame grouping."
+version = "0.1.0"
+license = {file = "LICENSE"}
+
+[project.urls]
+Repository = "https://github.com/drozbay/MaskVidExperiments"
+#  Used by Comfy Registry https://registry.comfy.org
+
+[tool.comfy]
+PublisherId = "drozbay"
+DisplayName = "MaskVidExperiments"
+Icon = ""
