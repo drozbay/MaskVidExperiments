@@ -18,6 +18,8 @@ result back into the full frames.
 
 ## Examples
 
+### Subject Crop / Uncrop
+
 Synthetic stress cases at default settings. Green is the tracked crop, red
 is zoomed.
 
@@ -29,6 +31,15 @@ is zoomed.
 | The face-mask case, where half the mask vanishes for a stretch: the crops don't react. | Side-to-side swings: absorbed by a slightly roomier crop that stays put instead of chasing every reversal. |
 | ![hard_cut](assets/hard_cut.gif) | ![offscreen_entry](assets/offscreen_entry.gif) |
 | Scene cut: one clean jump to the new framing, no hunting before or after. | Subject enters from off-screen: the clipped mask distorts the apparent size, but the crop settles without lurching. |
+
+### Mask To Latent Space
+
+Replacing a car with a German shepherd in an LTX video: feeding the pixel
+mask straight to Set Latent Noise Mask leaves ComfyUI to trilinear-resize it,
+which blurs the mask across frames and lets the car bleed through. The
+max-reduced mask from Mask To Latent Space inpaints cleanly.
+
+![mask to latent comparison](assets/MaskToLatentLTX.webp)
 
 ## Installation
 
@@ -138,13 +149,6 @@ Reduces a pixel-space mask batch to latent resolution using the VAE's
 spatial and temporal compression, aligned to how causal video VAEs group
 frames (first frame alone, then groups of N, as in Wan, Hunyuan, and LTX).
 Feed the result to Set Latent Noise Mask.
-
-![mask to latent comparison](assets/MaskToLatentLTX.webp)
-
-Replacing a car with a German shepherd in an LTX video: feeding the pixel
-mask straight to Set Latent Noise Mask leaves ComfyUI to trilinear-resize it,
-which blurs the mask across frames and lets the car bleed through. The
-max-reduced mask from this node inpaints cleanly.
 
 - `compression`: `auto` reads the compression factors from the connected
   VAE, `manual` enters them directly.
