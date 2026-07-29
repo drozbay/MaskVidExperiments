@@ -158,6 +158,24 @@ Feed the result to Set Latent Noise Mask.
 - `grow_spatial` and `grow_temporal`: grow (+) or shrink (-) the mask in
   pixels and frames before reduction.
 
+### MVEx Differential Diffusion (Soft)
+
+Drop-in variant of ComfyUI's Differential Diffusion. The stock node turns a
+grayscale denoise mask into hard binary masks that grow as sampling
+proceeds, so every intermediate mask has a razor-sharp edge no matter how
+feathered the input was. This version thresholds with a soft ramp instead,
+so each per-step mask keeps a soft edge whose width follows the blur
+already present in the input mask: heavily feathered masks stay feathered
+at every step, sharp masks stay sharp. Purely per-pixel with no spatial
+blur, so it is temporally stable on video.
+
+- `softness`: width of the threshold band in mask-value units. 0 exactly
+  reproduces the stock node; 1 disables the schedule and blends by the
+  mask as-is. The endpoints stay aligned with the stock schedule: fully
+  masked pixels denoise from the first step, unmasked pixels never do.
+- `strength`: blend between the scheduled mask and the raw input mask,
+  as in the stock node.
+
 ## Acknowledgements
 
 - The batchcrop nodes in [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes)
