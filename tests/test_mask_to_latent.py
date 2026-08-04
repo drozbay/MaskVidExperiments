@@ -15,6 +15,7 @@ m2l = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m2l)
 
 Node = m2l.MVEx_MaskToLatentSpaceNode
+InverseNode = m2l.MVEx_LatentMaskToMaskNode
 
 
 class FakeWanVAE:
@@ -203,6 +204,65 @@ def test_auto_without_vae_raises():
     except ValueError:
         return
     raise AssertionError("expected ValueError when vae is not connected")
+
+
+def run_inverse(mask, compression, frames=0, vae=None):
+    if compression.get("compression") == "auto" and vae is None and "vae" in compression:
+        vae = compression.pop("vae")
+    out = InverseNode.execute(mask, compression, frames, vae=vae)
+    return out.args[0]
+
+
+def test_inverse_auto_wan():
+    # latent frame 1 covers pixel frames 1-4
+    lat = torch.zeros(3, 8, 8)
+    lat[1, 0, 0] = 1.0
+    out = run_inverse(lat, AUTO())
+    assert out.shape == (9, 64, 64), out.shape
+    tprofile = out.amax(dim=(1, 2))
+    assert tprofile.tolist() == [0, 1, 1, 1, 1, 0, 0, 0, 0], tprofile.tolist()
+    assert out[1, :8, :8].min() == 1.0 and out[1, 8:, :].max() == 0.0
+
+
+def test_inverse_auto_minimax():
+    lat = torch.zeros(37, 4, 4)
+    lat[36] = 1.0
+    out = run_inverse(lat, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    assert out.shape == (124, 64, 64), out.shape
+    tprofile = out.amax(dim=(1, 2))
+    assert tprofile[:121].max() == 0.0 and tprofile[121:].min() == 1.0
+
+
+def test_inverse_explicit_frames_off_grid():
+    lat = torch.zeros(7, 4, 4)
+    lat[6] = 1.0
+    out = run_inverse(lat, {"compression": "auto", "vae": FakeMiniMaxVAE()}, frames=38)
+    assert out.shape == (38, 64, 64), out.shape
+    tprofile = out.amax(dim=(1, 2))
+    assert tprofile[19:].min() == 1.0  # last group [19, 22) plus merged tail to 38
+    assert tprofile[:19].max() == 0.0
+
+
+def test_inverse_manual_matches_auto():
+    lat = torch.rand(3, 8, 8)
+    assert torch.equal(run_inverse(lat, MANUAL()), run_inverse(lat, AUTO()))
+
+
+def test_inverse_image_vae():
+    lat = torch.rand(6, 8, 8)
+    out = run_inverse(lat, {"compression": "auto", "vae": FakeImageVAE()})
+    assert out.shape == (6, 64, 64), out.shape
+
+
+def test_roundtrip_minimax():
+    # forward then inverse: mask painted over exactly the frames whose group was hit
+    masks = torch.zeros(124, 64, 64)
+    masks[60, :32, :32] = 1.0
+    lat = run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    back = run_inverse(lat, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    assert back.shape == (124, 64, 64), back.shape
+    assert back[60, :32, :32].min() == 1.0  # original coverage survives
+    assert back[0].max() == 0.0 and back[123].max() == 0.0
 
 
 def test_soft_mask_values_survive():

@@ -6,7 +6,7 @@ from .nodes_subject_crop import (
     MVEx_SubjectCropNode,
     MVEx_SubjectUncropNode,
 )
-from .nodes_mask_to_latent import MVEx_MaskToLatentSpaceNode
+from .nodes_mask_to_latent import MVEx_LatentMaskToMaskNode, MVEx_MaskToLatentSpaceNode
 from .nodes_differential_soft import MVEx_DifferentialDiffusionSoftNode
 
 
@@ -18,6 +18,7 @@ class MaskVidExperimentsExtension(ComfyExtension):
             MVEx_SubjectCropAdvancedNode,
             MVEx_SubjectUncropNode,
             MVEx_MaskToLatentSpaceNode,
+            MVEx_LatentMaskToMaskNode,
             MVEx_DifferentialDiffusionSoftNode,
         ]
 
