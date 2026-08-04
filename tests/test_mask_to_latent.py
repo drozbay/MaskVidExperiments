@@ -29,6 +29,18 @@ class FakeWanVAE:
         return round(self.upscale_ratio[0](8192) / 8192)
 
 
+class FakeMiniMaxVAE:
+    def __init__(self):
+        self.downscale_ratio = (lambda a: max(1, (a - 5) // 17 * 5 + 2) if a > 1 else 1, 16, 16)
+        self.upscale_ratio = (lambda a: max(1, (a - 2) // 5 * 17 + 5), 16, 16)
+
+    def spacial_compression_encode(self):
+        return self.downscale_ratio[-1]
+
+    def temporal_compression_decode(self):
+        return round(self.upscale_ratio[0](8192) / 8192)
+
+
 class FakeImageVAE:
     downscale_ratio = 8
     upscale_ratio = 8
@@ -100,18 +112,64 @@ def test_temporal_max_vs_mean():
     assert abs(run(masks, AUTO(), temporal_method="mean")[1, 0, 0] - 0.25) < 1e-5
 
 
+def MANUAL(spatial=8, head_frames=1, head_latents=1, chunk_frames=4, chunk_latents=1):
+    return {"compression": "manual", "spatial": spatial,
+            "head_frames": head_frames, "head_latents": head_latents,
+            "chunk_frames": chunk_frames, "chunk_latents": chunk_latents}
+
+
 def test_manual_no_temporal():
     masks = torch.zeros(9, 64, 64)
-    comp = {"compression": "manual", "spatial": 8, "temporal": 1, "first_frame_special": False}
-    out = run(masks, comp)
+    out = run(masks, MANUAL(chunk_frames=1))
     assert out.shape == (9, 8, 8), out.shape
 
 
 def test_manual_uniform_grouping():
     masks = torch.zeros(8, 64, 64)
-    comp = {"compression": "manual", "spatial": 8, "temporal": 4, "first_frame_special": False}
-    out = run(masks, comp)
+    out = run(masks, MANUAL(head_frames=0, head_latents=0))
     assert out.shape == (2, 8, 8), out.shape
+
+
+def test_manual_wan_matches_auto():
+    masks = torch.rand(9, 64, 64)
+    assert torch.equal(run(masks, MANUAL()), run(masks, AUTO()))
+
+
+def test_auto_minimax_shape():
+    # 124 frames on the 17k+5 grid -> 5k+2 = 37 latent frames, 16x spatial
+    masks = torch.zeros(124, 64, 64)
+    out = run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    assert out.shape == (37, 4, 4), out.shape
+
+
+def test_auto_minimax_tail_alignment():
+    # a mask only in the final frames must land in the final latent frame
+    masks = torch.zeros(124, 64, 64)
+    masks[121:, :16, :16] = 1.0
+    out = run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    assert out[36].max() == 1.0
+    assert out[:36].max() == 0.0
+
+    masks = torch.zeros(124, 64, 64)
+    masks[0, :16, :16] = 1.0
+    out = run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    assert out[0].max() == 1.0 and out[1:].max() == 0.0
+
+
+def test_auto_minimax_off_grid_keeps_tail():
+    # 38 frames is off the 17k+5 grid: 7 latent frames, leftovers merge into the last
+    masks = torch.zeros(38, 64, 64)
+    masks[37, :16, :16] = 1.0
+    out = run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    assert out.shape[0] == 7, out.shape
+    assert out[6].max() == 1.0
+
+
+def test_manual_minimax_shape():
+    masks = torch.zeros(124, 64, 64)
+    out = run(masks, MANUAL(spatial=16, head_frames=5, head_latents=2,
+                            chunk_frames=17, chunk_latents=5))
+    assert out.shape == (37, 4, 4), out.shape
 
 
 def test_image_vae():

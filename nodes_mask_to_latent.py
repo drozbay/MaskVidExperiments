@@ -1,11 +1,12 @@
 """Pixel-space mask batch to latent-resolution mask for Set Latent Noise Mask.
 
 Core's reshape_mask trilinear-interpolates video masks across time, which
-drifts from causal VAE frame grouping (frame 0 alone, then groups of N) and
-mean-blends coverage. This node reduces with the VAE's real geometry and
-selectable reduction semantics. Generalized from WanMaskToLatentSpace in
-ComfyUI-WanVaceAdvanced.
+drifts from causal VAE frame grouping and mean-blends coverage. This node
+reduces with the VAE's real geometry and selectable reduction semantics.
+Generalized from WanMaskToLatentSpace in ComfyUI-WanVaceAdvanced.
 """
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -16,11 +17,11 @@ CATEGORY = "MaskVidExperiments"
 
 
 _TEMPORAL_REDUCE = {
-    "max": lambda g: g.amax(1),
-    "min": lambda g: g.amin(1),
-    "mean": lambda g: g.mean(1),
-    "first": lambda g: g[:, 0],
-    "last": lambda g: g[:, -1],
+    "max": lambda g: g.amax(0),
+    "min": lambda g: g.amin(0),
+    "mean": lambda g: g.mean(0),
+    "first": lambda g: g[0],
+    "last": lambda g: g[-1],
 }
 
 
@@ -50,6 +51,45 @@ def _grow_temporal(mask, steps):
     return x[0].transpose(0, 1).reshape(t, h, w)
 
 
+def _manual_frame_formula(head_frames, head_latents, chunk_frames, chunk_latents):
+    """Latent frame count for the first t pixel frames on a head + repeating
+    chunk grid. Partial trailing chunks complete no latent frame, matching the
+    chunked encoders (their leftover frames merge into the last group)."""
+    def formula(t):
+        if head_frames > 0 and t <= head_frames:
+            return max(1, math.ceil(t * head_latents / head_frames))
+        return head_latents + (t - head_frames) // chunk_frames * chunk_latents
+    return formula
+
+
+def _temporal_groups(formula, t):
+    """Frame ranges feeding each latent frame. Wherever the formula completes
+    d new latent frames, the pixel frames since the previous completion split
+    uniformly among them. Trailing frames that complete no latent frame merge
+    into the last group so their coverage is kept."""
+    groups = []
+    prev_t = 0
+    prev_l = 0
+    for tp in range(1, t + 1):
+        latents = formula(tp)
+        if latents <= prev_l:
+            continue
+        d = latents - prev_l
+        span = tp - prev_t
+        for j in range(d):
+            s = prev_t + round(j * span / d)
+            e = prev_t + round((j + 1) * span / d)
+            if e > s:
+                groups.append((s, e))
+        prev_t = tp
+        prev_l = latents
+    if not groups:
+        return [(0, t)]
+    if prev_t < t:
+        groups[-1] = (groups[-1][0], t)
+    return groups
+
+
 class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -69,16 +109,20 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
                              tooltip="The VAE used to encode the latents this mask will be applied to. Required when compression is auto."),
                 io.DynamicCombo.Input(
                     "compression",
-                    tooltip="auto: read the compression factors from the connected VAE. manual: enter them directly.",
+                    tooltip="auto: read the compression geometry from the connected VAE. manual: enter it directly.",
                     options=[
                         io.DynamicCombo.Option("auto", []),
                         io.DynamicCombo.Option("manual", [
                             io.Int.Input("spatial", default=8, min=1,
                                          tooltip="Pixels per latent pixel on each axis."),
-                            io.Int.Input("temporal", default=4, min=1,
-                                         tooltip="Frames per latent frame. 1 disables temporal reduction (image models)."),
-                            io.Boolean.Input("first_frame_special", default=True,
-                                             tooltip="First frame maps to its own latent frame and the rest group by the temporal factor, as in causal video VAEs (Wan, Hunyuan, LTX)."),
+                            io.Int.Input("head_frames", default=1, min=0,
+                                         tooltip="Pixel frames in the model's leading frame group. 1 for Wan, Hunyuan and LTX, 5 for MiniMax H3. 0 when the model has no leading group."),
+                            io.Int.Input("head_latents", default=1, min=0,
+                                         tooltip="Latent frames produced by the leading group. 1 for Wan, Hunyuan and LTX, 2 for MiniMax H3."),
+                            io.Int.Input("chunk_frames", default=4, min=1,
+                                         tooltip="Pixel frames in each repeating group after the leading group. 4 for Wan and Hunyuan, 8 for LTX, 17 for MiniMax H3. 1 disables temporal reduction (image models)."),
+                            io.Int.Input("chunk_latents", default=1, min=1,
+                                         tooltip="Latent frames produced by each repeating group. 1 for Wan, Hunyuan and LTX, 5 for MiniMax H3."),
                         ]),
                     ],
                 ),
@@ -101,15 +145,18 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
             if vae is None:
                 raise ValueError("auto compression requires a VAE to be connected")
             spatial = vae.spacial_compression_encode()
-            temporal = vae.temporal_compression_decode()
-            first_special = True
             ratio = getattr(vae, "downscale_ratio", None)
             if isinstance(ratio, (tuple, list)) and ratio and callable(ratio[0]):
                 formula = ratio[0]
+            else:
+                temporal = vae.temporal_compression_decode()
+                if temporal is not None and temporal > 1:
+                    formula = _manual_frame_formula(1, 1, temporal, 1)
         else:
             spatial = compression["spatial"]
-            temporal = compression["temporal"]
-            first_special = compression["first_frame_special"]
+            formula = _manual_frame_formula(
+                compression["head_frames"], compression["head_latents"],
+                compression["chunk_frames"], compression["chunk_latents"])
 
         x = masks
         if grow_spatial != 0:
@@ -132,24 +179,9 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
             x = F.interpolate(x, (lh, lw), mode="nearest-exact")
         x = x[:, 0]
 
-        if temporal is None or temporal <= 1 or t <= 1:
+        if formula is None or t <= 1:
             return io.NodeOutput(x)
 
-        head = x[:1] if first_special else x[:0]
-        rest = x[head.shape[0]:]
-        if rest.shape[0]:
-            remainder = rest.shape[0] % temporal
-            if remainder:
-                rest = torch.cat([rest, rest[-1:].expand(temporal - remainder, -1, -1)], 0)
-            rest = _TEMPORAL_REDUCE[temporal_method](rest.reshape(-1, temporal, lh, lw))
-        out = torch.cat([head, rest], 0)
-
-        if formula is not None:
-            # The VAE's own frame-count formula is authoritative; the grouping
-            # above only approximates it for exotic patterns
-            lt = formula(t)
-            if isinstance(lt, int) and 0 < lt < out.shape[0]:
-                out = out[:lt]
-            elif isinstance(lt, int) and lt > out.shape[0]:
-                out = torch.cat([out, out[-1:].expand(lt - out.shape[0], -1, -1)], 0)
+        reduce = _TEMPORAL_REDUCE[temporal_method]
+        out = torch.stack([reduce(x[s:e]) for s, e in _temporal_groups(formula, t)])
         return io.NodeOutput(out)
