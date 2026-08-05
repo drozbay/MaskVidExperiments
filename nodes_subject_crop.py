@@ -2,6 +2,7 @@
 boxes come from planner.py, which plans position, size, and shape jointly
 over the whole clip."""
 
+import logging
 import math
 
 import numpy as np
@@ -456,9 +457,9 @@ class MVEx_SubjectUncropNode(io.ComfyNode):
                 io.Image.Input("cropped_images", tooltip="Processed cropped frames."),
                 io.Image.Input("original_images", tooltip="Original frames to paste into."),
                 io.BoundingBox.Input("bboxes", force_input=True,
-                                     tooltip="Boxes from Subject Crop, one per frame. A single box or single frame is applied to every frame; extra boxes within a frame are ignored."),
+                                     tooltip="Boxes from Subject Crop, one per frame. A single box or single frame is applied to every frame; extra boxes within a frame are ignored. When inputs disagree on frame count, extra frames are dropped."),
                 io.Mask.Input("cropped_masks", optional=True,
-                              tooltip="Confines the paste to the mask, one per crop at any resolution. Used exactly as given; pre-blur the mask for a soft edge."),
+                              tooltip="Confines the paste to the mask, one per crop at any resolution. A single mask is applied to every frame. Used exactly as given; pre-blur the mask for a soft edge."),
                 io.Int.Input("feather", default=16, min=0,
                              tooltip="Blend width in pixels, feathered inward from the crop border. Sides touching the image edge are not feathered."),
             ],
@@ -467,22 +468,33 @@ class MVEx_SubjectUncropNode(io.ComfyNode):
 
     @classmethod
     def execute(cls, cropped_images, original_images, bboxes, feather, cropped_masks=None) -> io.NodeOutput:
-        n = original_images.shape[0]
-        if cropped_images.shape[0] != n:
-            raise ValueError(f"original_images ({n}) and cropped_images ({cropped_images.shape[0]}) must have the same frame count")
-
         if isinstance(bboxes, dict):
-            boxes = [bboxes] * n
+            frames = None
         elif isinstance(bboxes, list) and bboxes and all(isinstance(f, list) and f for f in bboxes):
-            frames = bboxes * n if len(bboxes) == 1 else bboxes
-            if len(frames) != n:
-                raise ValueError(f"got {len(bboxes)} bbox frames for {n} frames")
-            boxes = [f[0] for f in frames]
+            frames = bboxes
         else:
             raise ValueError("bboxes must be a single box or a per-frame list of box lists")
 
-        if cropped_masks is not None and cropped_masks.shape[0] != n:
-            raise ValueError(f"original_images ({n}) and cropped_masks ({cropped_masks.shape[0]}) must have the same frame count")
+        # single-frame bboxes and masks broadcast, so they don't cap n
+        counts = {"cropped_images": cropped_images.shape[0],
+                  "original_images": original_images.shape[0]}
+        if frames is not None and len(frames) > 1:
+            counts["bboxes"] = len(frames)
+        if cropped_masks is not None and cropped_masks.shape[0] > 1:
+            counts["cropped_masks"] = cropped_masks.shape[0]
+        n = min(counts.values())
+        if n < max(counts.values()):
+            got = ", ".join(f"{k}={v}" for k, v in counts.items())
+            logging.warning(f"MVEx Subject Uncrop: frame counts differ ({got}), using the first {n} frames of each")
+
+        cropped_images = cropped_images[:n]
+        original_images = original_images[:n]
+        if cropped_masks is not None:
+            cropped_masks = cropped_masks.expand(n, -1, -1) if cropped_masks.shape[0] == 1 else cropped_masks[:n]
+        if frames is None:
+            boxes = [bboxes] * n
+        else:
+            boxes = [f[0] for f in (frames * n if len(frames) == 1 else frames[:n])]
 
         img_h, img_w = original_images.shape[1], original_images.shape[2]
         out = original_images.clone()

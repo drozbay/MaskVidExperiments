@@ -90,13 +90,32 @@ def test_mask_resized_from_other_resolution():
     assert out[0, 28, 28, 0] == 1.0
 
 
-def test_mask_frame_count_validated():
-    masks = torch.ones(N + 1, 24, 24)
-    try:
-        run(0, masks)
-    except ValueError:
-        return
-    raise AssertionError("expected ValueError for mismatched mask count")
+def test_mismatched_counts_trim_to_shortest():
+    images = torch.zeros(N + 3, H, W, 3)
+    crops = torch.ones(N + 1, 24, 24, 3)
+    masks = torch.ones(N + 2, 24, 24)
+    out = Node.execute(cropped_images=crops, original_images=images,
+                       bboxes=[[BOX]] * N, feather=0, cropped_masks=masks)
+    assert out.args[0].shape[0] == N
+
+
+def test_single_mask_broadcasts():
+    masks = torch.zeros(1, 24, 24)
+    masks[:, 4:20, 4:20] = 1.0
+    out = run(0, masks)
+    assert out.shape[0] == N
+    for i in range(N):
+        assert out[i, 28, 28, 0] == 1.0    # inside mask
+        assert out[i, 17, 17, 0] == 0.0    # inside box, outside mask
+
+
+def test_broadcast_bboxes_do_not_cap_frames():
+    images = torch.zeros(N, H, W, 3)
+    crops = torch.ones(N, 24, 24, 3)
+    for bb in (BOX, [[BOX]]):
+        out = Node.execute(cropped_images=crops, original_images=images,
+                           bboxes=bb, feather=0, cropped_masks=None)
+        assert out.args[0].shape[0] == N
 
 
 for name, fn in sorted({k: v for k, v in globals().items() if k.startswith("test_")}.items()):
