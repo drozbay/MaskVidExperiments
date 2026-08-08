@@ -30,8 +30,16 @@ class FakeWanVAE:
         return round(self.upscale_ratio[0](8192) / 8192)
 
 
+class _FakeMiniMaxInner:
+    # chunk parameters as exposed by comfy.ldm.minimax.vae.VideoVAE
+    vae_ratio_t = 4
+    tokens_chunk_size = 5
+    frame_pre_padding = 3
+
+
 class FakeMiniMaxVAE:
     def __init__(self):
+        self.first_stage_model = _FakeMiniMaxInner()
         self.downscale_ratio = (lambda a: max(1, (a - 5) // 17 * 5 + 2) if a > 1 else 1, 16, 16)
         self.upscale_ratio = (lambda a: max(1, (a - 2) // 5 * 17 + 5), 16, 16)
 
@@ -113,10 +121,12 @@ def test_temporal_max_vs_mean():
     assert abs(run(masks, AUTO(), temporal_method="mean")[1, 0, 0] - 0.25) < 1e-5
 
 
-def MANUAL(spatial=8, head_frames=1, head_latents=1, chunk_frames=4, chunk_latents=1):
+def MANUAL(spatial=8, head_frames=1, head_latents=1, chunk_frames=4, chunk_latents=1,
+           frames_per_latent=""):
     return {"compression": "manual", "spatial": spatial,
             "head_frames": head_frames, "head_latents": head_latents,
-            "chunk_frames": chunk_frames, "chunk_latents": chunk_latents}
+            "chunk_frames": chunk_frames, "chunk_latents": chunk_latents,
+            "frames_per_latent": frames_per_latent}
 
 
 def test_manual_no_temporal():
@@ -158,12 +168,13 @@ def test_auto_minimax_tail_alignment():
 
 
 def test_auto_minimax_off_grid_keeps_tail():
-    # 38 frames is off the 17k+5 grid: 7 latent frames, leftovers merge into the last
+    # 38 frames is off the 17k+5 grid: the encoder pads to 3 chunks and trims,
+    # yielding 12 latents; the last real frame lands in the last kept group
     masks = torch.zeros(38, 64, 64)
     masks[37, :16, :16] = 1.0
     out = run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()})
-    assert out.shape[0] == 7, out.shape
-    assert out[6].max() == 1.0
+    assert out.shape[0] == 12, out.shape
+    assert out[11].max() == 1.0
 
 
 def test_manual_minimax_shape():
@@ -171,6 +182,67 @@ def test_manual_minimax_shape():
     out = run(masks, MANUAL(spatial=16, head_frames=5, head_latents=2,
                             chunk_frames=17, chunk_latents=5))
     assert out.shape == (37, 4, 4), out.shape
+
+
+def PATTERN(spatial=16, frames_per_latent="1,4,4,4,4"):
+    return MANUAL(spatial=spatial, frames_per_latent=frames_per_latent)
+
+
+def test_pattern_minimax_shape():
+    # 124 frames = 7*17+5 -> 37 latent frames, same count as the encoder
+    masks = torch.zeros(124, 64, 64)
+    out = run(masks, PATTERN())
+    assert out.shape == (37, 4, 4), out.shape
+
+
+def test_pattern_minimax_exact_groups():
+    # the VAE's causal cycle: frame 0 alone, then fours; frame 16 closes
+    # latent 4, frame 17 opens latent 5 alone
+    masks = torch.zeros(124, 64, 64)
+    masks[16, :16, :16] = 1.0
+    out = run(masks, PATTERN())
+    assert out[4].max() == 1.0 and out[:4].max() == 0.0 and out[5:].max() == 0.0
+
+    masks = torch.zeros(124, 64, 64)
+    masks[17, :16, :16] = 1.0
+    out = run(masks, PATTERN())
+    assert out[5].max() == 1.0 and out[:5].max() == 0.0 and out[6:].max() == 0.0
+
+
+def test_pattern_fixes_uniform_grid_blind_spot():
+    # the head 5->2 chunk 17->5 grid assigns frame 16 to latent 5's group, so
+    # latent 4 (which actually encodes it) gets no coverage; pattern mode does
+    masks = torch.zeros(124, 64, 64)
+    masks[16, :16, :16] = 1.0
+    old = run(masks, MANUAL(spatial=16, head_frames=5, head_latents=2,
+                            chunk_frames=17, chunk_latents=5))
+    new = run(masks, PATTERN())
+    assert old[4].max() == 0.0
+    assert new[4].max() == 1.0
+
+
+def test_pattern_inverse_roundtrip():
+    lat = torch.zeros(37, 4, 4)
+    lat[4] = 1.0
+    out = run_inverse(lat, PATTERN())
+    assert out.shape == (124, 64, 64), out.shape
+    tprofile = out.amax(dim=(1, 2))
+    assert tprofile.tolist() == [0] * 13 + [1] * 4 + [0] * 107, tprofile.tolist()
+
+
+def test_manual_pattern_matches_auto_minimax():
+    masks = torch.rand(124, 64, 64)
+    assert torch.equal(run(masks, PATTERN()),
+                       run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()}))
+
+
+def test_pattern_off_grid_tail():
+    # 120 frames ends mid-cycle: the last latent group is clipped to the video
+    masks = torch.zeros(120, 64, 64)
+    masks[119, :16, :16] = 1.0
+    out = run(masks, PATTERN())
+    assert out.shape[0] == 36, out.shape  # latent 36 would start at frame 120
+    assert out[35].max() == 1.0
 
 
 def test_image_vae():
@@ -225,22 +297,25 @@ def test_inverse_auto_wan():
 
 
 def test_inverse_auto_minimax():
+    # latent 36 is chunk 7 phase 1: pixel frames 120-123
     lat = torch.zeros(37, 4, 4)
     lat[36] = 1.0
     out = run_inverse(lat, {"compression": "auto", "vae": FakeMiniMaxVAE()})
     assert out.shape == (124, 64, 64), out.shape
     tprofile = out.amax(dim=(1, 2))
-    assert tprofile[:121].max() == 0.0 and tprofile[121:].min() == 1.0
+    assert tprofile[:120].max() == 0.0 and tprofile[120:].min() == 1.0
 
 
 def test_inverse_explicit_frames_off_grid():
+    # latent 6 covers frames 18-21; later groups reuse the last latent frame,
+    # so its paint extends through the remaining frames
     lat = torch.zeros(7, 4, 4)
     lat[6] = 1.0
     out = run_inverse(lat, {"compression": "auto", "vae": FakeMiniMaxVAE()}, frames=38)
     assert out.shape == (38, 64, 64), out.shape
     tprofile = out.amax(dim=(1, 2))
-    assert tprofile[19:].min() == 1.0  # last group [19, 22) plus merged tail to 38
-    assert tprofile[:19].max() == 0.0
+    assert tprofile[18:].min() == 1.0
+    assert tprofile[:18].max() == 0.0
 
 
 def test_inverse_manual_matches_auto():

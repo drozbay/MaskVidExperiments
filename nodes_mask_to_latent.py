@@ -72,29 +72,98 @@ def _manual_frame_inverse(head_frames, head_latents, chunk_frames, chunk_latents
     return inverse
 
 
+def _pattern_parse(text):
+    try:
+        pattern = [int(p) for p in text.replace(" ", "").split(",") if p]
+    except ValueError:
+        pattern = []
+    if not pattern or any(p < 1 for p in pattern):
+        raise ValueError("frames_per_latent must be comma-separated positive frame counts, e.g. 1,4,4,4,4")
+    return pattern
+
+
+def _pattern_starts(pattern):
+    starts = [0]
+    for p in pattern:
+        starts.append(starts[-1] + p)
+    return starts
+
+
+def _pattern_groups(pattern, t):
+    """Frame ranges feeding each latent frame on an exact repeating cycle from
+    frame 0. Latent frames whose span starts past the end of the video cover
+    only encoder padding and get no group."""
+    starts = _pattern_starts(pattern)
+    chunk, n = starts[-1], len(pattern)
+    groups = []
+    k = 0
+    while True:
+        s = (k // n) * chunk + starts[k % n]
+        if s >= t:
+            break
+        groups.append((s, min(s + pattern[k % n], t)))
+        k += 1
+    return groups
+
+
+def _pattern_inverse(pattern):
+    starts = _pattern_starts(pattern)
+    chunk, n = starts[-1], len(pattern)
+
+    def inverse(latents):
+        return (latents // n) * chunk + starts[latents % n]
+    return inverse
+
+
+def _pattern_geometry(spatial, pattern):
+    if max(pattern) == 1:
+        return spatial, None, None
+    return (spatial,
+            lambda t: _pattern_groups(pattern, t),
+            _pattern_inverse(pattern))
+
+
 def _resolve_geometry(compression, vae):
-    """Spatial factor, pixel-to-latent frame formula and its inverse, from the
-    connected VAE in auto mode or from the widget grid in manual. The formula
-    pair is (None, None) when there is no temporal compression."""
+    """Spatial factor, frames-to-groups function and latents-to-frame-count
+    inverse, from the connected VAE in auto mode or the widgets in manual.
+    Chunked causal encoders (MiniMax H3) expose their chunk parameters on the
+    VAE, from which auto derives the exact frames-per-latent cycle. The
+    function pair is (None, None) when there is no temporal compression."""
     if compression["compression"] == "auto":
         if vae is None:
             raise ValueError("auto compression requires a VAE to be connected")
         spatial = vae.spacial_compression_encode()
+        inner = getattr(vae, "first_stage_model", None)
+        ratio_t = getattr(inner, "vae_ratio_t", None)
+        chunk_latents = getattr(inner, "tokens_chunk_size", None)
+        if ratio_t is not None and chunk_latents is not None and ratio_t > 1:
+            pre_pad = getattr(inner, "frame_pre_padding", 0)
+            pattern = [ratio_t - pre_pad] + [ratio_t] * (chunk_latents - 1)
+            return _pattern_geometry(spatial, pattern)
+        formula = inverse = None
         down = getattr(vae, "downscale_ratio", None)
         if isinstance(down, (tuple, list)) and down and callable(down[0]):
+            formula = down[0]
             up = getattr(vae, "upscale_ratio", None)
             if isinstance(up, (tuple, list)) and up and callable(up[0]):
-                return spatial, down[0], up[0]
-            return spatial, down[0], None
-        temporal = vae.temporal_compression_decode()
-        if temporal is None or temporal <= 1:
-            return spatial, None, None
-        grid = (1, 1, temporal, 1)
+                inverse = up[0]
+        else:
+            temporal = vae.temporal_compression_decode()
+            if temporal is None or temporal <= 1:
+                return spatial, None, None
+            grid = (1, 1, temporal, 1)
+            formula = _manual_frame_formula(*grid)
+            inverse = _manual_frame_inverse(*grid)
     else:
         spatial = compression["spatial"]
+        text = compression.get("frames_per_latent", "")
+        if text.strip():
+            return _pattern_geometry(spatial, _pattern_parse(text))
         grid = (compression["head_frames"], compression["head_latents"],
                 compression["chunk_frames"], compression["chunk_latents"])
-    return spatial, _manual_frame_formula(*grid), _manual_frame_inverse(*grid)
+        formula = _manual_frame_formula(*grid)
+        inverse = _manual_frame_inverse(*grid)
+    return spatial, (lambda t: _temporal_groups(formula, t)), inverse
 
 
 def _temporal_groups(formula, t):
@@ -144,20 +213,22 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
                              tooltip="The VAE used to encode the latents this mask will be applied to. Required when compression is auto."),
                 io.DynamicCombo.Input(
                     "compression",
-                    tooltip="auto: read the compression geometry from the connected VAE. manual: enter it directly.",
+                    tooltip="auto: read the compression geometry from the connected VAE, including the exact frame cycle of chunked models like MiniMax H3. manual: enter it directly.",
                     options=[
                         io.DynamicCombo.Option("auto", []),
                         io.DynamicCombo.Option("manual", [
                             io.Int.Input("spatial", default=8, min=1,
                                          tooltip="Pixels per latent pixel on each axis."),
                             io.Int.Input("head_frames", default=1, min=0,
-                                         tooltip="Pixel frames in the model's leading frame group. 1 for Wan, Hunyuan and LTX, 5 for MiniMax H3. 0 when the model has no leading group."),
+                                         tooltip="Pixel frames in the model's leading frame group. 1 for Wan, Hunyuan and LTX. 0 when the model has no leading group."),
                             io.Int.Input("head_latents", default=1, min=0,
-                                         tooltip="Latent frames produced by the leading group. 1 for Wan, Hunyuan and LTX, 2 for MiniMax H3."),
+                                         tooltip="Latent frames produced by the leading group. 1 for Wan, Hunyuan and LTX."),
                             io.Int.Input("chunk_frames", default=4, min=1,
-                                         tooltip="Pixel frames in each repeating group after the leading group. 4 for Wan and Hunyuan, 8 for LTX, 17 for MiniMax H3. 1 disables temporal reduction (image models)."),
+                                         tooltip="Pixel frames in each repeating group after the leading group. 4 for Wan and Hunyuan, 8 for LTX. 1 disables temporal reduction (image models)."),
                             io.Int.Input("chunk_latents", default=1, min=1,
-                                         tooltip="Latent frames produced by each repeating group. 1 for Wan, Hunyuan and LTX, 5 for MiniMax H3."),
+                                         tooltip="Latent frames produced by each repeating group. 1 for Wan, Hunyuan and LTX."),
+                            io.String.Input("frames_per_latent", default="",
+                                            tooltip="Exact pixel frames covered by each latent frame, comma-separated, repeating from the first frame. Overrides the grid above when set. 1,4,4,4,4 with spatial 16 for MiniMax H3."),
                         ]),
                     ],
                 ),
@@ -175,7 +246,7 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
 
     @classmethod
     def execute(cls, masks, compression, spatial_method, temporal_method, grow_spatial, grow_temporal, vae=None) -> io.NodeOutput:
-        spatial, formula, _ = _resolve_geometry(compression, vae)
+        spatial, groups, _ = _resolve_geometry(compression, vae)
 
         x = masks
         if grow_spatial != 0:
@@ -198,11 +269,11 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
             x = F.interpolate(x, (lh, lw), mode="nearest-exact")
         x = x[:, 0]
 
-        if formula is None or t <= 1:
+        if groups is None or t <= 1:
             return io.NodeOutput(x)
 
         reduce = _TEMPORAL_REDUCE[temporal_method]
-        out = torch.stack([reduce(x[s:e]) for s, e in _temporal_groups(formula, t)])
+        out = torch.stack([reduce(x[s:e]) for s, e in groups(t)])
         return io.NodeOutput(out)
 
 
@@ -222,20 +293,22 @@ class MVEx_LatentMaskToMaskNode(io.ComfyNode):
                              tooltip="The VAE whose latents this mask matches. Required when compression is auto."),
                 io.DynamicCombo.Input(
                     "compression",
-                    tooltip="auto: read the compression geometry from the connected VAE. manual: enter it directly.",
+                    tooltip="auto: read the compression geometry from the connected VAE, including the exact frame cycle of chunked models like MiniMax H3. manual: enter it directly.",
                     options=[
                         io.DynamicCombo.Option("auto", []),
                         io.DynamicCombo.Option("manual", [
                             io.Int.Input("spatial", default=8, min=1,
                                          tooltip="Pixels per latent pixel on each axis."),
                             io.Int.Input("head_frames", default=1, min=0,
-                                         tooltip="Pixel frames in the model's leading frame group. 1 for Wan, Hunyuan and LTX, 5 for MiniMax H3. 0 when the model has no leading group."),
+                                         tooltip="Pixel frames in the model's leading frame group. 1 for Wan, Hunyuan and LTX. 0 when the model has no leading group."),
                             io.Int.Input("head_latents", default=1, min=0,
-                                         tooltip="Latent frames produced by the leading group. 1 for Wan, Hunyuan and LTX, 2 for MiniMax H3."),
+                                         tooltip="Latent frames produced by the leading group. 1 for Wan, Hunyuan and LTX."),
                             io.Int.Input("chunk_frames", default=4, min=1,
-                                         tooltip="Pixel frames in each repeating group after the leading group. 4 for Wan and Hunyuan, 8 for LTX, 17 for MiniMax H3. 1 disables temporal expansion (image models)."),
+                                         tooltip="Pixel frames in each repeating group after the leading group. 4 for Wan and Hunyuan, 8 for LTX. 1 disables temporal expansion (image models)."),
                             io.Int.Input("chunk_latents", default=1, min=1,
-                                         tooltip="Latent frames produced by each repeating group. 1 for Wan, Hunyuan and LTX, 5 for MiniMax H3."),
+                                         tooltip="Latent frames produced by each repeating group. 1 for Wan, Hunyuan and LTX."),
+                            io.String.Input("frames_per_latent", default="",
+                                            tooltip="Exact pixel frames covered by each latent frame, comma-separated, repeating from the first frame. Overrides the grid above when set. 1,4,4,4,4 with spatial 16 for MiniMax H3."),
                         ]),
                     ],
                 ),
@@ -247,12 +320,12 @@ class MVEx_LatentMaskToMaskNode(io.ComfyNode):
 
     @classmethod
     def execute(cls, mask, compression, frames, vae=None) -> io.NodeOutput:
-        spatial, formula, inverse = _resolve_geometry(compression, vae)
+        spatial, groups, inverse = _resolve_geometry(compression, vae)
 
         latents, lh, lw = mask.shape
         x = F.interpolate(mask[:, None], (lh * spatial, lw * spatial), mode="nearest-exact")[:, 0]
 
-        if formula is None:
+        if groups is None:
             return io.NodeOutput(x)
 
         if frames <= 0:
@@ -263,6 +336,6 @@ class MVEx_LatentMaskToMaskNode(io.ComfyNode):
             return io.NodeOutput(x[:1])
 
         out = x.new_zeros((frames, x.shape[1], x.shape[2]))
-        for i, (s, e) in enumerate(_temporal_groups(formula, frames)):
+        for i, (s, e) in enumerate(groups(frames)):
             out[s:e] = x[min(i, latents - 1)]
         return io.NodeOutput(out)
