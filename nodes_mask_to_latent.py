@@ -6,11 +6,13 @@ reduces with the VAE's real geometry and selectable reduction semantics.
 Generalized from WanMaskToLatentSpace in ComfyUI-WanVaceAdvanced.
 """
 
+import logging
 import math
 
 import torch
 import torch.nn.functional as F
 
+from comfy import model_management
 from comfy_api.latest import io
 
 CATEGORY = "MaskVidExperiments"
@@ -247,8 +249,22 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
     @classmethod
     def execute(cls, masks, compression, spatial_method, temporal_method, grow_spatial, grow_temporal, vae=None) -> io.NodeOutput:
         spatial, groups, _ = _resolve_geometry(compression, vae)
+        out = None
+        device = model_management.get_torch_device()
+        if device.type != "cpu":
+            # any accelerator failure (OOM, missing op on MPS or DirectML) falls
+            # back to the CPU path, which is slow but always correct
+            try:
+                out = cls._reduce(masks.to(device), spatial, groups, spatial_method, temporal_method, grow_spatial, grow_temporal)
+            except Exception as e:
+                logging.warning(f"MVEx Mask To Latent Space: mask reduction on {device} failed ({e}), retrying on CPU")
+                model_management.soft_empty_cache()
+        if out is None:
+            out = cls._reduce(masks, spatial, groups, spatial_method, temporal_method, grow_spatial, grow_temporal)
+        return io.NodeOutput(out.cpu())
 
-        x = masks
+    @staticmethod
+    def _reduce(x, spatial, groups, spatial_method, temporal_method, grow_spatial, grow_temporal):
         if grow_spatial != 0:
             x = _grow_spatial(x, grow_spatial)
         if grow_temporal != 0:
@@ -270,11 +286,10 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
         x = x[:, 0]
 
         if groups is None or t <= 1:
-            return io.NodeOutput(x)
+            return x
 
         reduce = _TEMPORAL_REDUCE[temporal_method]
-        out = torch.stack([reduce(x[s:e]) for s, e in groups(t)])
-        return io.NodeOutput(out)
+        return torch.stack([reduce(x[s:e]) for s, e in groups(t)])
 
 
 class MVEx_LatentMaskToMaskNode(io.ComfyNode):
