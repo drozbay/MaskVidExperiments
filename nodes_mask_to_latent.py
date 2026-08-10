@@ -91,38 +91,49 @@ def _pattern_starts(pattern):
     return starts
 
 
-def _pattern_groups(pattern, t):
-    """Frame ranges feeding each latent frame on an exact repeating cycle from
-    frame 0. Latent frames whose span starts past the end of the video cover
-    only encoder padding and get no group."""
+def _pattern_groups(pattern, t, drop=0):
+    """Frame ranges feeding each latent frame on an exact repeating cycle
+    from frame 0. A positive drop models encoders that pad to whole chunks
+    and trim that many trailing latents (MiniMax H3): frames from trimmed
+    latents merge into the last kept group, and groups lying entirely in
+    padding cover the final frame, which the padding repeats."""
     starts = _pattern_starts(pattern)
     chunk, n = starts[-1], len(pattern)
+    total = n * math.ceil(t / chunk)
+    if drop > 0:
+        kept = max(1, total - drop)
+    else:
+        kept = sum(1 for k in range(total)
+                   if (k // n) * chunk + starts[k % n] < t)
     groups = []
-    k = 0
-    while True:
+    for k in range(kept):
         s = (k // n) * chunk + starts[k % n]
-        if s >= t:
-            break
-        groups.append((s, min(s + pattern[k % n], t)))
-        k += 1
+        groups.append((min(s, t - 1), min(s + pattern[k % n], t)))
+    if drop > 0:
+        groups[-1] = (groups[-1][0], t)
     return groups
 
 
-def _pattern_inverse(pattern):
+def _pattern_inverse(pattern, drop=0):
     starts = _pattern_starts(pattern)
     chunk, n = starts[-1], len(pattern)
 
     def inverse(latents):
+        if drop > 0:
+            chunks = math.ceil((latents + drop) / n)
+            phase = latents - (chunks - 1) * n
+            if 1 <= phase <= n:
+                return (chunks - 1) * chunk + starts[phase]
         return (latents // n) * chunk + starts[latents % n]
     return inverse
 
 
-def _pattern_geometry(spatial, pattern):
-    if max(pattern) == 1:
+def _pattern_geometry(spatial, pattern, drop=0):
+    if max(pattern) == 1 and drop == 0:
         return spatial, None, None
     return (spatial,
-            lambda t: _pattern_groups(pattern, t),
-            _pattern_inverse(pattern))
+            lambda t: _pattern_groups(pattern, t, drop),
+            _pattern_inverse(pattern, drop))
 
 
 def _resolve_geometry(compression, vae):
@@ -140,8 +151,9 @@ def _resolve_geometry(compression, vae):
         chunk_latents = getattr(inner, "tokens_chunk_size", None)
         if ratio_t is not None and chunk_latents is not None and ratio_t > 1:
             pre_pad = getattr(inner, "frame_pre_padding", 0)
+            drop = getattr(inner, "token_drop", 0) or 0
             pattern = [ratio_t - pre_pad] + [ratio_t] * (chunk_latents - 1)
-            return _pattern_geometry(spatial, pattern)
+            return _pattern_geometry(spatial, pattern, drop)
         formula = inverse = None
         down = getattr(vae, "downscale_ratio", None)
         if isinstance(down, (tuple, list)) and down and callable(down[0]):
@@ -230,7 +242,7 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
                             io.Int.Input("chunk_latents", default=1, min=1,
                                          tooltip="Latent frames produced by each repeating group. 1 for Wan, Hunyuan and LTX."),
                             io.String.Input("frames_per_latent", default="",
-                                            tooltip="Exact pixel frames covered by each latent frame, comma-separated, repeating from the first frame. Overrides the grid above when set. 1,4,4,4,4 with spatial 16 for MiniMax H3."),
+                                            tooltip="Exact pixel frames covered by each latent frame, comma-separated, repeating from the first frame. Overrides the grid above when set. 1,4,4,4,4 with spatial 16 for MiniMax H3. For frame counts off the model's grid, use auto."),
                         ]),
                     ],
                 ),
@@ -323,7 +335,7 @@ class MVEx_LatentMaskToMaskNode(io.ComfyNode):
                             io.Int.Input("chunk_latents", default=1, min=1,
                                          tooltip="Latent frames produced by each repeating group. 1 for Wan, Hunyuan and LTX."),
                             io.String.Input("frames_per_latent", default="",
-                                            tooltip="Exact pixel frames covered by each latent frame, comma-separated, repeating from the first frame. Overrides the grid above when set. 1,4,4,4,4 with spatial 16 for MiniMax H3."),
+                                            tooltip="Exact pixel frames covered by each latent frame, comma-separated, repeating from the first frame. Overrides the grid above when set. 1,4,4,4,4 with spatial 16 for MiniMax H3. For frame counts off the model's grid, use auto."),
                         ]),
                     ],
                 ),
