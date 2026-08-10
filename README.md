@@ -143,6 +143,13 @@ keeping the real subject, including its soft edges.
 - `edge_grow`: grows kept regions back out so the subject's soft edges are
   preserved.
 
+### MVEx Frame Range Mask
+
+Builds a batch of solid masks at a given resolution, fully masked on the
+frames you list and empty on the rest. Useful for masking a stretch of a
+clip for inpainting, or for feeding a temporal mask straight into Mask To
+Latent Space.
+
 ### MVEx Mask To Latent Space
 
 Reduces a pixel-space mask batch to latent resolution using the VAE's
