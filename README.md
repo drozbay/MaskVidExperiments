@@ -165,6 +165,17 @@ Feed the result to Set Latent Noise Mask.
 - `grow_spatial` and `grow_temporal`: grow (+) or shrink (-) the mask in
   pixels and frames before reduction.
 
+### MVEx Audio Mask To Latent
+
+The audio counterpart: regenerates the chosen time ranges of an audio
+latent and keeps the rest, on a joint AV latent (MiniMax H3, LTX-2) or a
+bare audio latent. Timing and layout come from the connected audio VAE or
+from manual widgets, ranges from `time_ranges` text, a timeline mask, or
+start/end times. The node attaches the noise mask itself, since Set Latent
+Noise Mask cannot reach the audio side of a joint latent, and merges with
+any mask already there so copies chain. **MVEx Audio Mask Debug** reports
+which time ranges a latent's audio mask keeps and regenerates.
+
 ### MVEx Differential Diffusion (Soft)
 
 Drop-in variant of ComfyUI's Differential Diffusion. The stock node turns a
