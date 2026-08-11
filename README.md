@@ -100,6 +100,13 @@ Inputs:
   this ratio apart instead of changing smoothly.
 - `divisible_by`: crop width and height are rounded up to a multiple of
   this. Match the model's resolution requirement.
+- `megapixels`: resamples every crop to about this many megapixels, on the
+  `divisible_by` grid. Only the pixel count is pinned; the shape stays
+  whatever the planner chose, so nothing is stretched. Use it to hold the
+  crop at the resolution the model was trained for instead of letting it
+  follow the subject's size on screen. 0 keeps the crops at their planned
+  size. Subject Uncrop scales the result back to the original boxes on its
+  own, so no resize node is needed on either side.
 
 Outputs:
 
@@ -118,7 +125,9 @@ advanced defaults reproduce its firm/stillness combination.
 
 Pastes processed crops back into the original frames with a feathered
 border, optionally confined by a mask. The paste is pixel-exact when the
-crop size was not changed.
+crop size was not changed; crops that were resampled along the way (zoomed
+mode, `megapixels`, or a resize node in between) are scaled back to their
+box automatically.
 
 - `feather`: blend width in pixels, feathered inward from the crop border.
   Sides touching the image edge are not feathered.
