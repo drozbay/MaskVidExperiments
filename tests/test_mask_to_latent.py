@@ -35,6 +35,7 @@ class _FakeMiniMaxInner:
     vae_ratio_t = 4
     tokens_chunk_size = 5
     frame_pre_padding = 3
+    token_drop = 3
 
 
 class FakeMiniMaxVAE:
@@ -175,6 +176,47 @@ def test_auto_minimax_off_grid_keeps_tail():
     out = run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()})
     assert out.shape[0] == 12, out.shape
     assert out[11].max() == 1.0
+
+
+def test_auto_minimax_matches_encoder_count_all_lengths():
+    # encode_temporal pads to whole 17-frame clips and drops the last 3
+    # tokens, so the latent always has 5*ceil(t/17) - 3 frames
+    for t in [2, 6, 17, 18, 23, 30, 34, 51, 124, 150, 375]:
+        masks = torch.zeros(t, 64, 64)
+        out = run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+        expected = 5 * math.ceil(t / 17) - 3
+        assert out.shape[0] == expected, (t, out.shape[0], expected)
+
+
+def test_auto_minimax_trimmed_tail_merges():
+    # 23 frames: frame 22 falls in a trimmed token, so its coverage merges
+    # into the last kept latent instead of creating an extra group
+    masks = torch.zeros(23, 64, 64)
+    masks[22, :16, :16] = 1.0
+    out = run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    assert out.shape[0] == 7, out.shape
+    assert out[6].max() == 1.0 and out[:6].max() == 0.0
+
+
+def test_auto_minimax_padding_latent_repeats_last_frame():
+    # 18 frames: the 7th latent covers only encoder padding, which repeats
+    # frame 17, so it takes frame 17's mask
+    masks = torch.zeros(18, 64, 64)
+    masks[17, :16, :16] = 1.0
+    out = run(masks, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    assert out.shape[0] == 7, out.shape
+    assert out[5].max() == 1.0 and out[6].max() == 1.0
+    assert out[:5].max() == 0.0
+
+
+def test_inverse_auto_minimax_off_grid_counts():
+    # 7 latents decode from the canonical 22-frame source (17 + 5)
+    lat = torch.zeros(7, 4, 4)
+    out = run_inverse(lat, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    assert out.shape[0] == 22, out.shape
+    lat = torch.zeros(2, 4, 4)
+    out = run_inverse(lat, {"compression": "auto", "vae": FakeMiniMaxVAE()})
+    assert out.shape[0] == 5, out.shape
 
 
 def test_manual_minimax_shape():
