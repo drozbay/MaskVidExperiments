@@ -151,7 +151,7 @@ def test_debug_summary_present():
     out = run_zoomed(masks_from_rects(rects))
     debug = out.args[3]
     for key in ("mode: zoomed", "aspect_ratio:", "zoom_ratio:", "movement:",
-                "padding_worst:", "output_width:"):
+                "padding_worst:", "crop region resizing:"):
         assert key in debug, (key, debug)
 
 
@@ -408,7 +408,7 @@ def test_upscale_megapixels_keeps_shape():
         assert out.args[2] == plain.args[2], mode
         before = plain.args[0].shape[2] / plain.args[0].shape[1]
         assert abs(imgs.shape[2] / imgs.shape[1] - before) < 0.1, mode
-        assert f"output_width: {imgs.shape[2]}" in out.args[3]
+        assert f"-> {imgs.shape[2]} x {imgs.shape[1]}" in out.args[3]
         # nearest-exact keeps binary masks binary through the upscale
         assert set(msks.unique().tolist()) <= {0.0, 1.0}, mode
 
@@ -429,6 +429,8 @@ def test_upscale_megapixels_never_downscales():
         assert torch.equal(out.args[0], plain.args[0]), mode
         assert torch.equal(out.args[1], plain.args[1]), mode
         assert out.args[2] == plain.args[2], mode
+        # the debug line reports the clamp as a no-op resize
+        assert f"-> {plain.args[0].shape[2]} x {plain.args[0].shape[1]}" in out.args[3], mode
 
 
 def test_upscale_megapixels_round_trips_through_uncrop():

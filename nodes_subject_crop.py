@@ -146,7 +146,7 @@ def _cell_params(mode):
     }
 
 
-def _debug_summary(binary, boxes, scale, sel, info):
+def _debug_summary(binary, boxes, scale, sel, info, output_size):
     """Brief per-run report: what shape the planner chose and how well the
     plan delivered the padding promise."""
     n = len(boxes)
@@ -193,6 +193,8 @@ def _debug_summary(binary, boxes, scale, sel, info):
     if sel == "zoomed":
         lines.append(f"zoom_ratio: {max(hs) / max(min(hs), 1):.2f} "
                      "(largest box / smallest box)")
+    lines.append(f"crop region resizing: {max(ws)} x {max(hs)} -> "
+                 f"{output_size[0]} x {output_size[1]}")
     lines.append(f"movement: {travel:.0f}px "
                  "(total distance the box center travels)")
     if len(v) and scale > 1.0:
@@ -215,26 +217,27 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
         raise ValueError("all masks are empty, nothing to crop")
 
     boxes, info = planner.plan(binary, sel, p, divisible_by)
-    debug = _debug_summary(binary, boxes, p["crop_scale"], sel, info)
 
+    bw = max(b["width"] for b in boxes)
+    bh = max(b["height"] for b in boxes)
     size = None
     img_method, mask_method = "lanczos", "bilinear"
     if sel == "zoomed":
         # Target sized to the largest planned box: that stretch is ~1:1
         # and everything else upscales rather than losing detail.
-        th = math.ceil(max(b["height"] for b in boxes) / divisible_by) * divisible_by
+        th = math.ceil(bh / divisible_by) * divisible_by
         size = (math.ceil(th * info["aspect"] / divisible_by) * divisible_by, th)
     if upscale_megapixels > 0:
-        up = _upscale_size(*(size or (max(b["width"] for b in boxes),
-                                      max(b["height"] for b in boxes))),
-                           upscale_megapixels, divisible_by)
+        up = _upscale_size(*(size or (bw, bh)), upscale_megapixels, divisible_by)
         if up is not None:
             size = up
             img_method, mask_method = "bicubic", "nearest-exact"
 
+    debug = _debug_summary(binary, boxes, p["crop_scale"], sel, info,
+                           size or (bw, bh))
+
     if size is not None:
         tw, th = size
-        debug += f"\noutput_width: {tw}\noutput_height: {th}"
         cropped_images = torch.stack([
             _resize_image(original_images[i, b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"], :], tw, th, img_method)
             for i, b in enumerate(boxes)
