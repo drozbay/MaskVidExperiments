@@ -73,17 +73,22 @@ and follows only sustained motion.
 `crop_scale` sets the padding around the subject as a ratio of its size,
 `padding` and `prefer` set how firmly that padding is kept and whether
 stillness or tightness pays for it, and the `debug` output summarizes what
-the planner chose. **MVEx Subject Crop (Advanced)** exposes every internal
-dial, with the standard node's `padding` and `prefer` settings as presets
-over them.
+the planner chose. `upscale_megapixels` upscales every crop to about that
+many pixels on the `divisible_by` grid, keeping the shape the planner
+chose and never downscaling, so no resize node is needed on either side.
+**MVEx Subject Crop (Advanced)** exposes every internal dial, with the
+standard node's `padding` and `prefer` settings as presets over them.
 
 ### MVEx Subject Uncrop
 
 Pastes processed crops back into the original frames with a feathered
 border, optionally confined by the cropped masks. The paste is pixel-exact
-when the crop size was not changed, and the input order is bypass-correct:
-bypassing both Subject Crop and Subject Uncrop passes the processed frames
-straight through, so the whole crop pipeline can be A/B'd with two clicks.
+when the crop size was not changed, and crops that were resampled along
+the way (zoomed mode, `upscale_megapixels`, or a resize node in between)
+are scaled back to their box automatically. The input order is
+bypass-correct: bypassing both Subject Crop and Subject Uncrop passes the
+processed frames straight through, so the whole crop pipeline can be A/B'd
+with two clicks.
 
 ### MVEx Mask Cleanup
 

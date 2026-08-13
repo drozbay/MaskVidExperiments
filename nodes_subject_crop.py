@@ -83,15 +83,29 @@ def _open_reconstruct(masks, value_thresh, radius, min_frames):
 
 
 def _resize_image(img_hwc, w, h, method="lanczos"):
+    if img_hwc.shape[0] == h and img_hwc.shape[1] == w:
+        return img_hwc
     return comfy.utils.common_upscale(
         img_hwc.movedim(-1, 0).unsqueeze(0), w, h, method, "disabled"
     ).squeeze(0).movedim(0, -1)
 
 
-def _resize_mask(mask_hw, w, h):
+def _resize_mask(mask_hw, w, h, method="bilinear"):
+    if mask_hw.shape[0] == h and mask_hw.shape[1] == w:
+        return mask_hw
     return comfy.utils.common_upscale(
-        mask_hw[None, None], w, h, "bilinear", "disabled"
+        mask_hw[None, None], w, h, method, "disabled"
     )[0, 0]
+
+
+def _upscale_size(w, h, megapixels, divisible_by):
+    """Size upscaling a w x h crop to about megapixels pixels on the
+    divisible_by grid. None when already at or above the floor."""
+    scale = math.sqrt(megapixels * 1024 * 1024 / (w * h))
+    if scale <= 1.0:
+        return None
+    return (max(1, round(w * scale / divisible_by)) * divisible_by,
+            max(1, round(h * scale / divisible_by)) * divisible_by)
 
 
 def _cell_params(mode):
@@ -190,7 +204,7 @@ def _debug_summary(binary, boxes, scale, sel, info):
 
 
 def _plan_and_crop(original_images, masks, sel, p, divisible_by,
-                   mask_threshold):
+                   mask_threshold, upscale_megapixels=0.0):
     if original_images.shape[0] != masks.shape[0]:
         raise ValueError(f"original_images ({original_images.shape[0]}) and masks ({masks.shape[0]}) must have the same frame count")
     if original_images.shape[1:3] != masks.shape[1:3]:
@@ -203,18 +217,30 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
     boxes, info = planner.plan(binary, sel, p, divisible_by)
     debug = _debug_summary(binary, boxes, p["crop_scale"], sel, info)
 
+    size = None
+    img_method, mask_method = "lanczos", "bilinear"
     if sel == "zoomed":
         # Target sized to the largest planned box: that stretch is ~1:1
         # and everything else upscales rather than losing detail.
         th = math.ceil(max(b["height"] for b in boxes) / divisible_by) * divisible_by
-        tw = math.ceil(th * info["aspect"] / divisible_by) * divisible_by
+        size = (math.ceil(th * info["aspect"] / divisible_by) * divisible_by, th)
+    if upscale_megapixels > 0:
+        up = _upscale_size(*(size or (max(b["width"] for b in boxes),
+                                      max(b["height"] for b in boxes))),
+                           upscale_megapixels, divisible_by)
+        if up is not None:
+            size = up
+            img_method, mask_method = "bicubic", "nearest-exact"
+
+    if size is not None:
+        tw, th = size
         debug += f"\noutput_width: {tw}\noutput_height: {th}"
         cropped_images = torch.stack([
-            _resize_image(original_images[i, b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"], :], tw, th)
+            _resize_image(original_images[i, b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"], :], tw, th, img_method)
             for i, b in enumerate(boxes)
         ])
         cropped_masks = torch.stack([
-            _resize_mask(masks[i, b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"]], tw, th)
+            _resize_mask(masks[i, b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"]], tw, th, mask_method)
             for i, b in enumerate(boxes)
         ])
     else:
@@ -228,6 +254,11 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
         ])
     return io.NodeOutput(cropped_images, cropped_masks,
                          [[b] for b in boxes], debug)
+
+
+_UPSCALE_MEGAPIXELS = io.Float.Input(
+    "upscale_megapixels", default=0.0, min=0.0, max=16.0, step=0.05,
+    tooltip="Upscale every crop to at least about this many megapixels, on the divisible_by grid, keeping its shape. Bicubic for images, nearest exact for masks. Never downscales. 0 disables.")
 
 
 _OUTPUTS = [
@@ -341,12 +372,13 @@ class MVEx_SubjectCropNode(io.ComfyNode):
                 ),
                 io.Int.Input("divisible_by", default=16, min=1,
                              tooltip="Crop width and height are rounded up to a multiple of this. Match the model's resolution requirement."),
+                _UPSCALE_MEGAPIXELS,
             ],
             outputs=_OUTPUTS,
         )
 
     @classmethod
-    def execute(cls, original_images, masks, mode, divisible_by) -> io.NodeOutput:
+    def execute(cls, original_images, masks, mode, divisible_by, upscale_megapixels=0.0) -> io.NodeOutput:
         # extents count pixels at least 10% present: feathered edges stay
         # in the box, a blur's numerically-nonzero tail does not
         sel = mode["mode"]
@@ -356,7 +388,7 @@ class MVEx_SubjectCropNode(io.ComfyNode):
         else:
             p = _cell_params(mode)
         return _plan_and_crop(original_images, masks, sel, p,
-                              divisible_by, 0.1)
+                              divisible_by, 0.1, upscale_megapixels)
 
 
 class MVEx_SubjectCropAdvancedNode(io.ComfyNode):
@@ -428,18 +460,19 @@ class MVEx_SubjectCropAdvancedNode(io.ComfyNode):
                                tooltip="Mask values above this count as subject when measuring extents. Near 0 even faint feathered edges steer the crop; near 1 only solid mask cores do."),
                 io.Int.Input("divisible_by", default=16, min=1,
                              tooltip="Crop width and height are rounded up to a multiple of this."),
+                _UPSCALE_MEGAPIXELS,
             ],
             outputs=_OUTPUTS,
         )
 
     @classmethod
-    def execute(cls, original_images, masks, mode, mask_threshold, divisible_by) -> io.NodeOutput:
+    def execute(cls, original_images, masks, mode, mask_threshold, divisible_by, upscale_megapixels=0.0) -> io.NodeOutput:
         p = dict(mode)
         for key, val in (("resize_cost", 2.0), ("zoom_step", 1.0),
                          ("max_zoom_rate", 0.0)):
             p.setdefault(key, val)
         return _plan_and_crop(original_images, masks, mode["mode"], p,
-                              divisible_by, mask_threshold)
+                              divisible_by, mask_threshold, upscale_megapixels)
 
 
 class MVEx_SubjectUncropNode(io.ComfyNode):
@@ -501,9 +534,9 @@ class MVEx_SubjectUncropNode(io.ComfyNode):
         for i, b in enumerate(boxes):
             # BOUNDING_BOX payloads are convention, not schema; SAM3 emits float coords
             x, y, w, h = (int(round(b[k])) for k in ("x", "y", "width", "height"))
-            crop = cropped_images[i]
-            if crop.shape[0] != h or crop.shape[1] != w:
-                crop = _resize_image(crop, w, h)
+            # a crop resampled anywhere along the way (Subject Crop's
+            # upscale_megapixels, zoomed mode, or a resize node) scales back here
+            crop = _resize_image(cropped_images[i], w, h)
 
             alpha = torch.ones(h, w, dtype=out.dtype, device=out.device)
             fx, fy = min(feather, w // 2), min(feather, h // 2)
@@ -521,9 +554,7 @@ class MVEx_SubjectUncropNode(io.ComfyNode):
                     alpha[:, w - fx:] *= ramp.flip(0)[None, :]
 
             if cropped_masks is not None:
-                m = cropped_masks[i]
-                if m.shape[0] != h or m.shape[1] != w:
-                    m = _resize_mask(m, w, h)
+                m = _resize_mask(cropped_masks[i], w, h)
                 alpha = alpha * m.clamp(0.0, 1.0).to(dtype=out.dtype, device=out.device)
 
             alpha = alpha[..., None]

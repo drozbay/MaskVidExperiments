@@ -386,6 +386,70 @@ def test_combined_is_static_union_with_padding():
     assert b["x"] <= 10 - 8 and b["x"] + b["width"] >= 217 + 8
 
 
+def test_upscale_megapixels_keeps_shape():
+    rects = [(100, 160, 130, 190)] * 12
+    masks = masks_from_rects(rects)
+    images = torch.zeros(12, H, W, 3)
+    for mode, aspect in (("tracked", 2.0), ("combined", 0.0), ("zoomed", 0.0)):
+        cell = {"mode": mode, "crop_scale": 1.5, "aspect_ratio": aspect}
+        if mode != "combined":
+            cell.update(padding="firm", prefer="stillness", seamless_loop=False)
+        if mode == "zoomed":
+            cell.update(zoom_step=1.0, pad_surplus_tol=16)
+        plain = Node.execute(images, masks, cell, divisible_by=16)
+        out = Node.execute(images, masks, cell, divisible_by=16,
+                           upscale_megapixels=0.25)
+        imgs, msks = out.args[0], out.args[1]
+        assert imgs.shape[0] == 12 and msks.shape == imgs.shape[:3]
+        assert imgs.shape[1] % 16 == 0 and imgs.shape[2] % 16 == 0, mode
+        pixels = imgs.shape[1] * imgs.shape[2]
+        assert abs(pixels / (0.25 * 1024 * 1024) - 1) < 0.15, (mode, imgs.shape)
+        # the planned boxes are untouched and the shape survives the resample
+        assert out.args[2] == plain.args[2], mode
+        before = plain.args[0].shape[2] / plain.args[0].shape[1]
+        assert abs(imgs.shape[2] / imgs.shape[1] - before) < 0.1, mode
+        assert f"output_width: {imgs.shape[2]}" in out.args[3]
+        # nearest-exact keeps binary masks binary through the upscale
+        assert set(msks.unique().tolist()) <= {0.0, 1.0}, mode
+
+
+def test_upscale_megapixels_never_downscales():
+    rects = [(100, 160, 130, 190)] * 12
+    masks = masks_from_rects(rects)
+    images = torch.rand(12, H, W, 3)
+    for mode in ("tracked", "combined", "zoomed"):
+        cell = {"mode": mode, "crop_scale": 1.5, "aspect_ratio": 0.0}
+        if mode != "combined":
+            cell.update(padding="firm", prefer="stillness", seamless_loop=False)
+        if mode == "zoomed":
+            cell.update(zoom_step=1.0, pad_surplus_tol=16)
+        plain = Node.execute(images, masks, cell, divisible_by=16)
+        out = Node.execute(images, masks, cell, divisible_by=16,
+                           upscale_megapixels=0.005)
+        assert torch.equal(out.args[0], plain.args[0]), mode
+        assert torch.equal(out.args[1], plain.args[1]), mode
+        assert out.args[2] == plain.args[2], mode
+
+
+def test_upscale_megapixels_round_trips_through_uncrop():
+    rects = [(100, 160, 130, 190)] * 6
+    masks = masks_from_rects(rects)
+    images = torch.rand(6, H, W, 3)
+    cell = {"mode": "tracked", "crop_scale": 1.5, "padding": "firm",
+            "prefer": "stillness", "aspect_ratio": 0.0, "seamless_loop": False}
+    out = Node.execute(images, masks, cell, divisible_by=16,
+                       upscale_megapixels=0.25)
+    b = out.args[2][0][0]
+    assert out.args[0].shape[1:3] != (b["height"], b["width"]), "test needs a real resample"
+    back = sc.MVEx_SubjectUncropNode.execute(
+        out.args[0], images, out.args[2], feather=0).args[0]
+    assert back.shape == images.shape
+    # the paste lands in the planned box and leaves everything else untouched
+    outside = torch.ones(H, W, dtype=torch.bool)
+    outside[b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"]] = False
+    assert torch.equal(back[:, outside], images[:, outside])
+
+
 for name, fn in sorted({k: v for k, v in globals().items() if k.startswith("test_")}.items()):
     check(name, fn)
 
