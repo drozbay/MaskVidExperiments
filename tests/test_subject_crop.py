@@ -433,6 +433,89 @@ def test_upscale_megapixels_never_downscales():
         assert f"-> {plain.args[0].shape[2]} x {plain.args[0].shape[1]}" in out.args[3], mode
 
 
+def test_crop_scale_zero_is_full_frame():
+    rects = [(100, 160, 130, 190)] * 8
+    masks = masks_from_rects(rects)
+    images = torch.rand(8, H, W, 3)
+    for mode in ("tracked", "combined", "zoomed"):
+        cell = {"mode": mode, "crop_scale": 0.0, "aspect_ratio": 0.0}
+        if mode != "combined":
+            cell.update(padding="firm", prefer="stillness", seamless_loop=False)
+        if mode == "zoomed":
+            cell.update(zoom_step=1.0, pad_surplus_tol=16)
+        out = Node.execute(images, masks, cell, divisible_by=16)
+        boxes = [f[0] for f in out.args[2]]
+        assert all(b == {"x": 0, "y": 0, "width": W, "height": H} for b in boxes), mode
+        # 320x240 is already on the 16 grid: pixel-exact passthrough
+        assert torch.equal(out.args[0], images), mode
+        assert torch.equal(out.args[1], masks), mode
+        assert "(full frame)" in out.args[3], mode
+
+
+def test_full_frame_rounds_up_off_grid_and_round_trips():
+    masks = masks_from_rects([(100, 160, 130, 190)] * 4)
+    # smooth gradient so the up/down resample round trip stays tight
+    images = (torch.arange(W, dtype=torch.float32) / W).expand(4, H, W)[..., None].repeat(1, 1, 1, 3)
+    cell = {"mode": "tracked", "crop_scale": 0.0, "padding": "firm",
+            "prefer": "stillness", "aspect_ratio": 0.0, "seamless_loop": False}
+    out = Node.execute(images, masks, cell, divisible_by=32)
+    # 240 is off the 32 grid and rounds up to 256; 320 is already on it
+    assert out.args[0].shape[1:3] == (256, 320)
+    b = out.args[2][0][0]
+    assert (b["width"], b["height"]) == (W, H)
+    assert "crop region resizing: 320 x 240 -> 320 x 256" in out.args[3]
+    back = sc.MVEx_SubjectUncropNode.execute(
+        out.args[0], images, out.args[2], feather=0).args[0]
+    assert back.shape == images.shape
+    assert (back - images).abs().max() < 0.02
+
+
+def test_full_frame_allows_empty_masks():
+    masks = torch.zeros(4, H, W)
+    images = torch.rand(4, H, W, 3)
+    cell = {"mode": "tracked", "crop_scale": 0.0, "padding": "firm",
+            "prefer": "stillness", "aspect_ratio": 0.0, "seamless_loop": False}
+    out = Node.execute(images, masks, cell, divisible_by=16)
+    assert torch.equal(out.args[0], images)
+    assert torch.equal(out.args[1], masks)
+
+
+def test_full_frame_upscale_megapixels():
+    masks = masks_from_rects([(100, 160, 130, 190)] * 4)
+    images = torch.rand(4, H, W, 3)
+    cell = {"mode": "tracked", "crop_scale": 0.0, "padding": "firm",
+            "prefer": "stillness", "aspect_ratio": 0.0, "seamless_loop": False}
+    out = Node.execute(images, masks, cell, divisible_by=16,
+                       upscale_megapixels=0.25)
+    h, w = out.args[0].shape[1:3]
+    assert h % 16 == 0 and w % 16 == 0
+    assert abs(h * w / (0.25 * 1024 * 1024) - 1) < 0.15, (w, h)
+    assert abs(w / h - W / H) < 0.1
+    assert set(out.args[1].unique().tolist()) <= {0.0, 1.0}
+
+
+def test_crop_scale_below_one_rejected():
+    masks = masks_from_rects([(100, 160, 130, 190)] * 4)
+    images = torch.rand(4, H, W, 3)
+    try:
+        Node.execute(images, masks,
+                     {"mode": "combined", "crop_scale": 0.5, "aspect_ratio": 0.0},
+                     divisible_by=16)
+        raise AssertionError("crop_scale 0.5 should be rejected")
+    except ValueError:
+        pass
+
+
+def test_full_frame_through_advanced_node():
+    masks = masks_from_rects([(100, 160, 130, 190)] * 4)
+    images = torch.rand(4, H, W, 3)
+    out = sc.MVEx_SubjectCropAdvancedNode.execute(
+        images, masks, {"mode": "tracked", "crop_scale": 0.0},
+        mask_threshold=0.1, divisible_by=16)
+    assert torch.equal(out.args[0], images)
+    assert all(f[0] == {"x": 0, "y": 0, "width": W, "height": H} for f in out.args[2])
+
+
 def test_upscale_megapixels_round_trips_through_uncrop():
     rects = [(100, 160, 130, 190)] * 6
     masks = masks_from_rects(rects)

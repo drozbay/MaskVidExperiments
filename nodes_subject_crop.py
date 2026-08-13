@@ -212,17 +212,31 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
     if original_images.shape[1:3] != masks.shape[1:3]:
         raise ValueError(f"original_images ({original_images.shape[2]}x{original_images.shape[1]}) and masks ({masks.shape[2]}x{masks.shape[1]}) must have the same dimensions")
 
-    binary = masks.detach().cpu().numpy() > mask_threshold
-    if not binary.any():
-        raise ValueError("all masks are empty, nothing to crop")
+    if 0.0 < p["crop_scale"] < 1.0:
+        raise ValueError("crop_scale must be 0 (full frame) or at least 1.0")
+    full_frame = p["crop_scale"] <= 0.0
 
-    boxes, info = planner.plan(binary, sel, p, divisible_by)
+    binary = masks.detach().cpu().numpy() > mask_threshold
+    if full_frame:
+        img_h, img_w = masks.shape[1], masks.shape[2]
+        boxes = [{"x": 0, "y": 0, "width": img_w, "height": img_h}
+                 for _ in range(masks.shape[0])]
+        info = {"aspect": img_w / img_h}
+    else:
+        if not binary.any():
+            raise ValueError("all masks are empty, nothing to crop")
+        boxes, info = planner.plan(binary, sel, p, divisible_by)
 
     bw = max(b["width"] for b in boxes)
     bh = max(b["height"] for b in boxes)
     size = None
     img_method, mask_method = "lanczos", "bilinear"
-    if sel == "zoomed":
+    if full_frame:
+        gw = math.ceil(bw / divisible_by) * divisible_by
+        gh = math.ceil(bh / divisible_by) * divisible_by
+        if (gw, gh) != (bw, bh):
+            size = (gw, gh)
+    elif sel == "zoomed":
         # Target sized to the largest planned box: that stretch is ~1:1
         # and everything else upscales rather than losing detail.
         th = math.ceil(bh / divisible_by) * divisible_by
@@ -233,8 +247,9 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
             size = up
             img_method, mask_method = "bicubic", "nearest-exact"
 
-    debug = _debug_summary(binary, boxes, p["crop_scale"], sel, info,
-                           size or (bw, bh))
+    debug = _debug_summary(binary, boxes, p["crop_scale"],
+                           f"{sel} (full frame)" if full_frame else sel,
+                           info, size or (bw, bh))
 
     if size is not None:
         tw, th = size
@@ -338,14 +353,14 @@ class MVEx_SubjectCropNode(io.ComfyNode):
                     tooltip="In order of increasing complexity. combined: one static crop with padding around the subject's whole travel. tracked: a constant-size crop that stays still until the subject would leave it, then moves as little as possible. zoomed: the crop also follows the subject's size, planned over the whole clip, every crop resampled to a fixed output resolution.",
                     options=[
                         io.DynamicCombo.Option("combined", [
-                            io.Float.Input("crop_scale", default=1.5, min=1.0, max=4.0, step=0.05,
-                                           tooltip="Crop size as a multiple of the subject's combined extent across all frames: 1.5 leaves a third of the crop as margin around the whole travel. 1.0 hugs the travel exactly."),
+                            io.Float.Input("crop_scale", default=1.5, min=0.0, max=4.0, step=0.05,
+                                           tooltip="Crop size as a multiple of the subject's combined extent across all frames: 1.5 leaves a third of the crop as margin around the whole travel. 1.0 hugs the travel exactly. At 0 cropping is skipped and the whole frame passes through, resized to the divisible_by grid when needed."),
                             io.Float.Input("aspect_ratio", default=0.0, min=0.0, max=10.0, step=0.01,
                                            tooltip="Crop shape as width divided by height (e.g. 1.78), reached by growing the smaller dimension. 0 sizes width and height from the mask's whole travel."),
                         ]),
                         io.DynamicCombo.Option("tracked", [
-                            io.Float.Input("crop_scale", default=1.5, min=1.0, max=4.0, step=0.05,
-                                           tooltip="Crop size as a multiple of the subject's size: 1.5 keeps the subject at two thirds of the crop with the rest as padding, at any resolution. 1.0 crops tight, leaving no padding for the padding setting to keep; 4.0 surrounds the subject with three times its own size."),
+                            io.Float.Input("crop_scale", default=1.5, min=0.0, max=4.0, step=0.05,
+                                           tooltip="Crop size as a multiple of the subject's size: 1.5 keeps the subject at two thirds of the crop with the rest as padding, at any resolution. 1.0 crops tight, leaving no padding for the padding setting to keep; 4.0 surrounds the subject with three times its own size. At 0 cropping is skipped and the whole frame passes through, resized to the divisible_by grid when needed."),
                             io.Combo.Input("padding", options=["guaranteed", "firm", "flexible"], default="firm",
                                            tooltip="How firmly the crop_scale padding is kept. guaranteed: never less than promised on any frame, whatever it costs in size or movement; only the image edge can break it, and mask noise counts as subject, so clean the masks first. firm: at least 70% is always kept, the rest yields briefly during fast motion. flexible: padding yields first whenever keeping it would cost stillness or tightness."),
                             io.Combo.Input("prefer", options=["stillness", "tightness"], default="stillness",
@@ -356,8 +371,8 @@ class MVEx_SubjectCropNode(io.ComfyNode):
                                              tooltip="Plan the crop path so the last frame wraps seamlessly into the first. Only for clips that genuinely repeat."),
                         ]),
                         io.DynamicCombo.Option("zoomed", [
-                            io.Float.Input("crop_scale", default=1.5, min=1.0, max=4.0, step=0.05,
-                                           tooltip="Crop size as a multiple of the subject's size: 1.5 keeps the subject at two thirds of the crop with the rest as padding, so the subject holds a constant share of the output at any resolution. 1.0 crops tight, leaving no padding for the padding setting to keep; 4.0 surrounds the subject with three times its own size."),
+                            io.Float.Input("crop_scale", default=1.5, min=0.0, max=4.0, step=0.05,
+                                           tooltip="Crop size as a multiple of the subject's size: 1.5 keeps the subject at two thirds of the crop with the rest as padding, so the subject holds a constant share of the output at any resolution. 1.0 crops tight, leaving no padding for the padding setting to keep; 4.0 surrounds the subject with three times its own size. At 0 cropping is skipped and the whole frame passes through, resized to the divisible_by grid when needed."),
                             io.Combo.Input("padding", options=["guaranteed", "firm", "flexible"], default="firm",
                                            tooltip="How firmly the crop_scale padding is kept. guaranteed: never less than promised on any frame, whatever it costs in size, movement, or rescaling; only the image edge can break it, and mask noise counts as subject, so clean the masks first. firm: at least 70% is always kept, the rest yields briefly during fast motion. flexible: padding yields first whenever keeping it would cost stillness or tightness."),
                             io.Combo.Input("prefer", options=["stillness", "tightness"], default="stillness",
@@ -399,8 +414,8 @@ class MVEx_SubjectCropAdvancedNode(io.ComfyNode):
     def define_schema(cls):
         def dial(name, **over):
             build = {
-                "crop_scale": lambda: io.Float.Input("crop_scale", default=1.5, min=1.0, max=4.0, step=0.05,
-                                                     tooltip="How much padding the crop promises around the subject, as a multiple of its size. At 1.0 the crop is tight with no padding; at 4.0 the subject sits in three times its own size of padding."),
+                "crop_scale": lambda: io.Float.Input("crop_scale", default=1.5, min=0.0, max=4.0, step=0.05,
+                                                     tooltip="How much padding the crop promises around the subject, as a multiple of its size. At 1.0 the crop is tight with no padding; at 4.0 the subject sits in three times its own size of padding. At 0 cropping is skipped and the whole frame passes through, resized to the divisible_by grid when needed."),
                 "min_padding_allowed": lambda: io.Float.Input("min_padding_allowed", default=0.7, min=0.0, max=1.0, step=0.05,
                                                         tooltip="The padding you always get, as a fraction of the promise. At 0 padding may be sacrificed entirely (flexible); at 1 the full promise can only be broken by the image edge (guaranteed); 0.7 is firm."),
                 "min_padding_allowed_window": lambda: io.Int.Input("min_padding_allowed_window", default=16, min=1, max=256,

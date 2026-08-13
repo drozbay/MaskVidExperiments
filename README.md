@@ -76,6 +76,10 @@ stillness or tightness pays for it, and the `debug` output summarizes what
 the planner chose. `upscale_megapixels` upscales every crop to about that
 many pixels on the `divisible_by` grid, keeping the shape the planner
 chose and never downscaling, so no resize node is needed on either side.
+Setting `crop_scale` to 0 skips cropping entirely: the whole frame passes
+through, still sized to the `divisible_by` grid and the
+`upscale_megapixels` floor, so the rest of the workflow works unchanged
+with tracking off.
 **MVEx Subject Crop (Advanced)** exposes every internal dial, with the
 standard node's `padding` and `prefer` settings as presets over them.
 
