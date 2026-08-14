@@ -43,8 +43,8 @@ max-reduced mask from Mask To Latent Space inpaints cleanly.
 
 ## Installation
 
-Clone into `custom_nodes` and restart ComfyUI. Needs a reasonably recent
-ComfyUI install, with no dependencies beyond ComfyUI's own.
+Clone into `custom_nodes` and restart ComfyUI. Needs ComfyUI v0.15.0 or
+newer, with no dependencies beyond ComfyUI's own.
 
 ```
 cd ComfyUI/custom_nodes
