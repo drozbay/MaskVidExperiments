@@ -53,6 +53,23 @@ def _grow_temporal(mask, steps):
     return x[0].transpose(0, 1).reshape(t, h, w)
 
 
+def _token_snap(x, token, method):
+    """Unify each token block of latent pixels so the whole block carries one
+    value, replicate-padding odd edges the way the model does."""
+    t, h, w = x.shape
+    x = F.pad(x[:, None], (0, -w % token, 0, -h % token), mode="replicate")
+    if method == "max":
+        x = F.max_pool2d(x, token)
+    elif method == "min":
+        x = -F.max_pool2d(-x, token)
+    elif method == "mean":
+        x = F.avg_pool2d(x, token)
+    else:
+        x = F.interpolate(x, (x.shape[-2] // token, x.shape[-1] // token), mode="nearest-exact")
+    x = x.repeat_interleave(token, dim=-2).repeat_interleave(token, dim=-1)
+    return x[:, 0, :h, :w]
+
+
 def _manual_frame_formula(head_frames, head_latents, chunk_frames, chunk_latents):
     """Latent frame count for the first t pixel frames on a head + repeating
     chunk grid. Partial trailing chunks complete no latent frame, matching the
@@ -137,11 +154,14 @@ def _pattern_geometry(spatial, pattern, drop=0):
 
 
 def _resolve_geometry(compression, vae):
-    """Spatial factor, frames-to-groups function and latents-to-frame-count
-    inverse, from the connected VAE in auto mode or the widgets in manual.
-    Chunked causal encoders (MiniMax H3) expose their chunk parameters on the
-    VAE, from which auto derives the exact frames-per-latent cycle. The
-    function pair is (None, None) when there is no temporal compression."""
+    """Spatial factor, frames-to-groups function, latents-to-frame-count
+    inverse and latent pixels per model token, from the connected VAE in auto
+    mode or the widgets in manual. Chunked causal encoders (MiniMax H3) expose
+    their chunk parameters on the VAE, from which auto derives the exact
+    frames-per-latent cycle; that family's DiT reads the mask per 2x2 latent
+    patch, so auto also sets the token size to 2 there. The function pair is
+    (None, None) when there is no temporal compression."""
+    token = 1
     if compression["compression"] == "auto":
         if vae is None:
             raise ValueError("auto compression requires a VAE to be connected")
@@ -153,7 +173,7 @@ def _resolve_geometry(compression, vae):
             pre_pad = getattr(inner, "frame_pre_padding", 0)
             drop = getattr(inner, "token_drop", 0) or 0
             pattern = [ratio_t - pre_pad] + [ratio_t] * (chunk_latents - 1)
-            return _pattern_geometry(spatial, pattern, drop)
+            return _pattern_geometry(spatial, pattern, drop) + (2,)
         formula = inverse = None
         down = getattr(vae, "downscale_ratio", None)
         if isinstance(down, (tuple, list)) and down and callable(down[0]):
@@ -164,20 +184,21 @@ def _resolve_geometry(compression, vae):
         else:
             temporal = vae.temporal_compression_decode()
             if temporal is None or temporal <= 1:
-                return spatial, None, None
+                return spatial, None, None, token
             grid = (1, 1, temporal, 1)
             formula = _manual_frame_formula(*grid)
             inverse = _manual_frame_inverse(*grid)
     else:
         spatial = compression["spatial"]
+        token = compression.get("token_spatial", 1)
         text = compression.get("frames_per_latent", "")
         if text.strip():
-            return _pattern_geometry(spatial, _pattern_parse(text))
+            return _pattern_geometry(spatial, _pattern_parse(text)) + (token,)
         grid = (compression["head_frames"], compression["head_latents"],
                 compression["chunk_frames"], compression["chunk_latents"])
         formula = _manual_frame_formula(*grid)
         inverse = _manual_frame_inverse(*grid)
-    return spatial, (lambda t: _temporal_groups(formula, t)), inverse
+    return spatial, (lambda t: _temporal_groups(formula, t)), inverse, token
 
 
 def _temporal_groups(formula, t):
@@ -215,7 +236,7 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
             node_id="MVEx_MaskToLatentSpace",
             display_name="MVEx Mask To Latent Space",
             category=CATEGORY,
-            description="Reduces a pixel-space mask batch to latent resolution using the VAE's spatial and temporal compression, aligned to causal video VAE frame grouping. Feed the result to Set Latent Noise Mask.",
+            description="Reduces a pixel-space mask batch to latent resolution using the VAE's spatial and temporal compression, aligned to causal video VAE frame grouping and to the model's token grid (2x2 latent pixels for MiniMax H3). Feed the result to Set Latent Noise Mask.",
             inputs=[
                 io.Mask.Input("masks", tooltip="Pixel-space masks, one per frame."),
                 # vae stays top-level rather than inside the auto option: a
@@ -227,12 +248,14 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
                              tooltip="The VAE used to encode the latents this mask will be applied to. Required when compression is auto."),
                 io.DynamicCombo.Input(
                     "compression",
-                    tooltip="auto: read the compression geometry from the connected VAE, including the exact frame cycle of chunked models like MiniMax H3. manual: enter it directly.",
+                    tooltip="auto: read the compression geometry from the connected VAE, including the exact frame cycle and 2x2 token grid of chunked models like MiniMax H3. manual: enter it directly.",
                     options=[
                         io.DynamicCombo.Option("auto", []),
                         io.DynamicCombo.Option("manual", [
                             io.Int.Input("spatial", default=8, min=1,
                                          tooltip="Pixels per latent pixel on each axis."),
+                            io.Int.Input("token_spatial", default=1, min=1,
+                                         tooltip="Latent pixels per model token on each axis; the mask is unified over each token block. 2 for MiniMax H3, 1 for models that read the mask per latent pixel."),
                             io.Int.Input("head_frames", default=1, min=0,
                                          tooltip="Pixel frames in the model's leading frame group. 1 for Wan, Hunyuan and LTX. 0 when the model has no leading group."),
                             io.Int.Input("head_latents", default=1, min=0,
@@ -260,23 +283,23 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
 
     @classmethod
     def execute(cls, masks, compression, spatial_method, temporal_method, grow_spatial, grow_temporal, vae=None) -> io.NodeOutput:
-        spatial, groups, _ = _resolve_geometry(compression, vae)
+        spatial, groups, _, token = _resolve_geometry(compression, vae)
         out = None
         device = model_management.get_torch_device()
         if device.type != "cpu":
             # any accelerator failure (OOM, missing op on MPS or DirectML) falls
             # back to the CPU path, which is slow but always correct
             try:
-                out = cls._reduce(masks.to(device), spatial, groups, spatial_method, temporal_method, grow_spatial, grow_temporal)
+                out = cls._reduce(masks.to(device), spatial, groups, token, spatial_method, temporal_method, grow_spatial, grow_temporal)
             except Exception as e:
                 logging.warning(f"MVEx Mask To Latent Space: mask reduction on {device} failed ({e}), retrying on CPU")
                 model_management.soft_empty_cache()
         if out is None:
-            out = cls._reduce(masks, spatial, groups, spatial_method, temporal_method, grow_spatial, grow_temporal)
+            out = cls._reduce(masks, spatial, groups, token, spatial_method, temporal_method, grow_spatial, grow_temporal)
         return io.NodeOutput(out.cpu())
 
     @staticmethod
-    def _reduce(x, spatial, groups, spatial_method, temporal_method, grow_spatial, grow_temporal):
+    def _reduce(x, spatial, groups, token, spatial_method, temporal_method, grow_spatial, grow_temporal):
         if grow_spatial != 0:
             x = _grow_spatial(x, grow_spatial)
         if grow_temporal != 0:
@@ -297,6 +320,9 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
             x = F.interpolate(x, (lh, lw), mode="nearest-exact")
         x = x[:, 0]
 
+        if token > 1:
+            x = _token_snap(x, token, spatial_method)
+
         if groups is None or t <= 1:
             return x
 
@@ -311,7 +337,7 @@ class MVEx_LatentMaskToMaskNode(io.ComfyNode):
             node_id="MVEx_LatentMaskToMask",
             display_name="MVEx Latent Mask To Mask",
             category=CATEGORY,
-            description="Expands a latent-resolution mask back to pixel resolution for visualization or testing. Each latent frame paints every pixel frame in its group, so detail collapsed by the latent reduction stays collapsed.",
+            description="Expands a latent-resolution mask back to pixel resolution for visualization or testing. Each latent frame paints every pixel frame in its group and each token block paints as one value, so detail collapsed by the latent reduction stays collapsed.",
             inputs=[
                 io.Mask.Input("mask", tooltip="Latent-resolution masks, one per latent frame."),
                 # vae stays top-level for the same frontend reason as in
@@ -320,12 +346,14 @@ class MVEx_LatentMaskToMaskNode(io.ComfyNode):
                              tooltip="The VAE whose latents this mask matches. Required when compression is auto."),
                 io.DynamicCombo.Input(
                     "compression",
-                    tooltip="auto: read the compression geometry from the connected VAE, including the exact frame cycle of chunked models like MiniMax H3. manual: enter it directly.",
+                    tooltip="auto: read the compression geometry from the connected VAE, including the exact frame cycle and 2x2 token grid of chunked models like MiniMax H3. manual: enter it directly.",
                     options=[
                         io.DynamicCombo.Option("auto", []),
                         io.DynamicCombo.Option("manual", [
                             io.Int.Input("spatial", default=8, min=1,
                                          tooltip="Pixels per latent pixel on each axis."),
+                            io.Int.Input("token_spatial", default=1, min=1,
+                                         tooltip="Latent pixels per model token on each axis; the strongest value in each token block paints the whole block, matching how the model reads the mask. 2 for MiniMax H3, 1 for models that read the mask per latent pixel."),
                             io.Int.Input("head_frames", default=1, min=0,
                                          tooltip="Pixel frames in the model's leading frame group. 1 for Wan, Hunyuan and LTX. 0 when the model has no leading group."),
                             io.Int.Input("head_latents", default=1, min=0,
@@ -347,7 +375,11 @@ class MVEx_LatentMaskToMaskNode(io.ComfyNode):
 
     @classmethod
     def execute(cls, mask, compression, frames, vae=None) -> io.NodeOutput:
-        spatial, groups, inverse = _resolve_geometry(compression, vae)
+        spatial, groups, inverse, token = _resolve_geometry(compression, vae)
+
+        if token > 1:
+            # the model reads the strongest value per token, show that
+            mask = _token_snap(mask, token, "max")
 
         latents, lh, lw = mask.shape
         x = F.interpolate(mask[:, None], (lh * spatial, lw * spatial), mode="nearest-exact")[:, 0]

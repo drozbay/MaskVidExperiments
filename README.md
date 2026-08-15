@@ -115,8 +115,10 @@ Reduces a pixel-space mask batch to latent resolution using the VAE's
 spatial and temporal compression, aligned to how causal video VAEs group
 frames instead of the trilinear resize ComfyUI applies on its own (see the
 example above). Feed the result to Set Latent Noise Mask. `auto` reads the
-geometry from the connected VAE, including the exact frame cycle of
-chunked models like MiniMax H3, and `manual` enters it directly.
+geometry from the connected VAE, including the exact frame cycle and 2x2
+token grid of chunked models like MiniMax H3, and `manual` enters it
+directly. The mask is unified over each model token, so what you preview
+with MVEx Latent Mask To Mask is exactly what the model acts on.
 
 ### MVEx Audio Mask To Latent
 
