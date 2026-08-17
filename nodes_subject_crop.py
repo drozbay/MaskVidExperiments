@@ -99,10 +99,11 @@ def _resize_mask(mask_hw, w, h, method="bilinear"):
 
 
 def _upscale_size(w, h, megapixels, divisible_by):
-    """Size upscaling a w x h crop to about megapixels pixels on the
-    divisible_by grid. None when already at or above the floor."""
-    scale = math.sqrt(megapixels * 1024 * 1024 / (w * h))
-    if scale <= 1.0:
+    """Size scaling a w x h crop to about abs(megapixels) pixels on the
+    divisible_by grid. A positive value is a floor: None when already at or
+    above it. A negative value is a target, reached by downscaling too."""
+    scale = math.sqrt(abs(megapixels) * 1024 * 1024 / (w * h))
+    if megapixels > 0 and scale <= 1.0:
         return None
     return (max(1, round(w * scale / divisible_by)) * divisible_by,
             max(1, round(h * scale / divisible_by)) * divisible_by)
@@ -241,7 +242,7 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
         # and everything else upscales rather than losing detail.
         th = math.ceil(bh / divisible_by) * divisible_by
         size = (math.ceil(th * info["aspect"] / divisible_by) * divisible_by, th)
-    if upscale_megapixels > 0:
+    if upscale_megapixels != 0:
         up = _upscale_size(*(size or (bw, bh)), upscale_megapixels, divisible_by)
         if up is not None:
             size = up
@@ -275,8 +276,8 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
 
 
 _UPSCALE_MEGAPIXELS = io.Float.Input(
-    "upscale_megapixels", default=0.0, min=0.0, max=16.0, step=0.05,
-    tooltip="Upscale every crop to at least about this many megapixels, on the divisible_by grid, keeping its shape. Bicubic for images, nearest exact for masks. Never downscales. 0 disables.")
+    "upscale_megapixels", default=0.0, min=-16.0, max=16.0, step=0.05,
+    tooltip="Upscale the cropped images/masks to this many megapixels, on the divisible_by grid, using bicubic for images and nearest exact for masks. Set to 0.0 to disable. (Use a negative value to allow scaling down as well as up.)")
 
 
 _OUTPUTS = [
