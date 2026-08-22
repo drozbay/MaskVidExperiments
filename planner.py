@@ -426,10 +426,8 @@ def plan(binary, sel, p, divisible_by=16):
                 w0 = h0 * ar
             else:
                 h0 = w0 / ar
-        w = min(math.ceil(w0 / divisible_by) * divisible_by,
-                (img_w // divisible_by) * divisible_by or img_w)
-        h = min(math.ceil(h0 / divisible_by) * divisible_by,
-                (img_h // divisible_by) * divisible_by or img_h)
+        w = min(math.ceil(w0 / divisible_by) * divisible_by, img_w)
+        h = min(math.ceil(h0 / divisible_by) * divisible_by, img_h)
         x = min(max(0, round((xs.min() + xs.max() + 1) / 2 - w / 2)), img_w - w)
         y = min(max(0, round((ys.min() + ys.max() + 1) / 2 - h / 2)), img_h - h)
         box = {"x": int(x), "y": int(y), "width": int(w), "height": int(h)}
@@ -441,10 +439,8 @@ def plan(binary, sel, p, divisible_by=16):
 
     if sel == "tracked":
         Wf, Hf, xt, yt = _solve_tracked(pre, img_w, img_h, p)
-        w = min(math.ceil(Wf / divisible_by) * divisible_by,
-                (img_w // divisible_by) * divisible_by or img_w)
-        h = min(math.ceil(Hf / divisible_by) * divisible_by,
-                (img_h // divisible_by) * divisible_by or img_h)
+        w = min(math.ceil(Wf / divisible_by) * divisible_by, img_w)
+        h = min(math.ceil(Hf / divisible_by) * divisible_by, img_h)
         lo_x = np.maximum(bx1 + 1 - w, 0)
         hi_x = np.minimum(np.maximum(bx0, 0), img_w - w)
         lo_y = np.maximum(by1 + 1 - h, 0)

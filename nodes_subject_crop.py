@@ -232,16 +232,17 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
     bh = max(b["height"] for b in boxes)
     size = None
     img_method, mask_method = "lanczos", "bilinear"
-    if full_frame:
-        gw = math.ceil(bw / divisible_by) * divisible_by
-        gh = math.ceil(bh / divisible_by) * divisible_by
-        if (gw, gh) != (bw, bh):
-            size = (gw, gh)
-    elif sel == "zoomed":
+    if sel == "zoomed" and not full_frame:
         # Target sized to the largest planned box: that stretch is ~1:1
         # and everything else upscales rather than losing detail.
         th = math.ceil(bh / divisible_by) * divisible_by
         size = (math.ceil(th * info["aspect"] / divisible_by) * divisible_by, th)
+    else:
+        # a box spanning a whole off-grid image axis is resized onto the grid
+        gw = math.ceil(bw / divisible_by) * divisible_by
+        gh = math.ceil(bh / divisible_by) * divisible_by
+        if (gw, gh) != (bw, bh):
+            size = (gw, gh)
     if upscale_megapixels != 0:
         up = _upscale_size(*(size or (bw, bh)), upscale_megapixels, divisible_by)
         if up is not None:
