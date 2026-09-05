@@ -41,15 +41,19 @@ def _grow_spatial(mask, steps):
     return x[:, 0]
 
 
-def _grow_temporal(mask, steps):
-    """Grey dilate (+) or erode (-) along time, one frame per step."""
+def _grow_temporal(mask, steps, mode="both"):
+    """Grey dilate (+) or erode (-) along time, one frame per step, into both
+    sides, only later frames (forward) or only earlier frames (backward).
+    Borders act as subject for erosion so edge contact is kept."""
     t, h, w = mask.shape
     x = mask.reshape(t, h * w).transpose(0, 1)[None]
+    pad = {"both": (1, 1), "forward": (1, 0), "backward": (0, 1)}[mode]
+    kernel = pad[0] + pad[1] + 1
     for _ in range(abs(steps)):
         if steps > 0:
-            x = F.max_pool1d(x, 3, 1, 1)
+            x = F.max_pool1d(F.pad(x, pad), kernel, 1)
         else:
-            x = -F.max_pool1d(-x, 3, 1, 1)
+            x = -F.max_pool1d(F.pad(-x, pad, value=-1.0), kernel, 1)
     return x[0].transpose(0, 1).reshape(t, h, w)
 
 
@@ -155,8 +159,9 @@ def _pattern_geometry(spatial, pattern, drop=0):
 
 def _resolve_geometry(compression, vae):
     """Spatial factor, frames-to-groups function, latents-to-frame-count
-    inverse and latent pixels per model token, from the connected VAE in auto
-    mode or the widgets in manual. Chunked causal encoders (MiniMax H3) expose
+    inverse, latent pixels per model token, and latents per independent encoder
+    chunk (None when the encoder has no chunk boundary), from the connected VAE
+    in auto mode or the widgets in manual. Chunked causal encoders (MiniMax H3) expose
     their chunk parameters on the VAE, from which auto derives the exact
     frames-per-latent cycle; that family's DiT reads the mask per 2x2 latent
     patch, so auto also sets the token size to 2 there. The function pair is
@@ -173,7 +178,7 @@ def _resolve_geometry(compression, vae):
             pre_pad = getattr(inner, "frame_pre_padding", 0)
             drop = getattr(inner, "token_drop", 0) or 0
             pattern = [ratio_t - pre_pad] + [ratio_t] * (chunk_latents - 1)
-            return _pattern_geometry(spatial, pattern, drop) + (2,)
+            return _pattern_geometry(spatial, pattern, drop) + (2, chunk_latents)
         formula = inverse = None
         down = getattr(vae, "downscale_ratio", None)
         if isinstance(down, (tuple, list)) and down and callable(down[0]):
@@ -184,7 +189,7 @@ def _resolve_geometry(compression, vae):
         else:
             temporal = vae.temporal_compression_decode()
             if temporal is None or temporal <= 1:
-                return spatial, None, None, token
+                return spatial, None, None, token, None
             grid = (1, 1, temporal, 1)
             formula = _manual_frame_formula(*grid)
             inverse = _manual_frame_inverse(*grid)
@@ -193,12 +198,13 @@ def _resolve_geometry(compression, vae):
         token = compression.get("token_spatial", 1)
         text = compression.get("frames_per_latent", "")
         if text.strip():
-            return _pattern_geometry(spatial, _pattern_parse(text)) + (token,)
+            pattern = _pattern_parse(text)
+            return _pattern_geometry(spatial, pattern) + (token, len(pattern))
         grid = (compression["head_frames"], compression["head_latents"],
                 compression["chunk_frames"], compression["chunk_latents"])
         formula = _manual_frame_formula(*grid)
         inverse = _manual_frame_inverse(*grid)
-    return spatial, (lambda t: _temporal_groups(formula, t)), inverse, token
+    return spatial, (lambda t: _temporal_groups(formula, t)), inverse, token, None
 
 
 def _temporal_groups(formula, t):
@@ -277,33 +283,40 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
                              tooltip="Grow (+) or shrink (-) the mask this many pixels before reduction."),
                 io.Int.Input("grow_temporal", default=0, min=-64, max=64,
                              tooltip="Grow (+) or shrink (-) the mask this many frames before reduction."),
+                io.Combo.Input("grow_temp_mode", options=["both", "forward", "backward", "chunks"], default="both",
+                               tooltip="Directionality of grow_temporal: both: earlier and later frames. forward: later frames only. backward: earlier frames only. chunks: whole encoder chunks instead of frames, so the mask only changes at chunk boundaries. (requires a chunked encoder like H3 VAE)."),
             ],
             outputs=[io.Mask.Output(display_name="mask", tooltip="Latent-resolution mask for Set Latent Noise Mask.")],
         )
 
     @classmethod
-    def execute(cls, masks, compression, spatial_method, temporal_method, grow_spatial, grow_temporal, vae=None) -> io.NodeOutput:
-        spatial, groups, _, token = _resolve_geometry(compression, vae)
+    def execute(cls, masks, compression, spatial_method, temporal_method, grow_spatial, grow_temporal, grow_temp_mode, vae=None) -> io.NodeOutput:
+        spatial, groups, _, token, chunk_latents = _resolve_geometry(compression, vae)
+        if grow_temp_mode == "chunks":
+            if chunk_latents is None:
+                raise ValueError("grow_temp_mode chunks requires a chunked encoder (auto with MiniMax H3, or a manual frames_per_latent pattern)")
+            if grow_temporal < 0:
+                raise ValueError("grow_temp_mode chunks needs grow_temporal >= 1 (whole chunks, 1 masks each chunk as a unit)")
         out = None
         device = model_management.get_torch_device()
         if device.type != "cpu":
             # any accelerator failure (OOM, missing op on MPS or DirectML) falls
             # back to the CPU path, which is slow but always correct
             try:
-                out = cls._reduce(masks.to(device), spatial, groups, token, spatial_method, temporal_method, grow_spatial, grow_temporal)
+                out = cls._reduce(masks.to(device), spatial, groups, token, spatial_method, temporal_method, grow_spatial, grow_temporal, grow_temp_mode, chunk_latents)
             except Exception as e:
                 logging.warning(f"MVEx Mask To Latent Space: mask reduction on {device} failed ({e}), retrying on CPU")
                 model_management.soft_empty_cache()
         if out is None:
-            out = cls._reduce(masks, spatial, groups, token, spatial_method, temporal_method, grow_spatial, grow_temporal)
+            out = cls._reduce(masks, spatial, groups, token, spatial_method, temporal_method, grow_spatial, grow_temporal, grow_temp_mode, chunk_latents)
         return io.NodeOutput(out.cpu())
 
     @staticmethod
-    def _reduce(x, spatial, groups, token, spatial_method, temporal_method, grow_spatial, grow_temporal):
+    def _reduce(x, spatial, groups, token, spatial_method, temporal_method, grow_spatial, grow_temporal, grow_temp_mode="both", chunk_latents=None):
         if grow_spatial != 0:
             x = _grow_spatial(x, grow_spatial)
-        if grow_temporal != 0:
-            x = _grow_temporal(x, grow_temporal)
+        if grow_temporal != 0 and grow_temp_mode != "chunks":
+            x = _grow_temporal(x, grow_temporal, grow_temp_mode)
 
         t, h, w = x.shape
         lh = max(1, h // spatial)
@@ -327,7 +340,20 @@ class MVEx_MaskToLatentSpaceNode(io.ComfyNode):
             return x
 
         reduce = _TEMPORAL_REDUCE[temporal_method]
-        return torch.stack([reduce(x[s:e]) for s, e in groups(t)])
+        x = torch.stack([reduce(x[s:e]) for s, e in groups(t)])
+
+        if grow_temp_mode == "chunks" and grow_temporal > 0 and chunk_latents and x.shape[0] > 1:
+            # every latent frame of a chunk carries the union of a window of
+            # whole chunks around its own, widening forward first and then
+            # backward, so the mask only changes at chunk boundaries
+            ahead = grow_temporal // 2
+            behind = (grow_temporal - 1) // 2
+            starts = list(range(0, x.shape[0], chunk_latents))
+            unions = [x[s:s + chunk_latents].amax(dim=0) for s in starts]
+            for i, s in enumerate(starts):
+                window = unions[max(0, i - behind):i + ahead + 1]
+                x[s:s + chunk_latents] = torch.stack(window).amax(dim=0)
+        return x
 
 
 class MVEx_LatentMaskToMaskNode(io.ComfyNode):
@@ -375,7 +401,7 @@ class MVEx_LatentMaskToMaskNode(io.ComfyNode):
 
     @classmethod
     def execute(cls, mask, compression, frames, vae=None) -> io.NodeOutput:
-        spatial, groups, inverse, token = _resolve_geometry(compression, vae)
+        spatial, groups, inverse, token, _ = _resolve_geometry(compression, vae)
 
         if token > 1:
             # the model reads the strongest value per token, show that
