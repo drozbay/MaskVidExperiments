@@ -509,8 +509,8 @@ class MVEx_SubjectUncropNode(io.ComfyNode):
                 # processed full frames, not the untouched originals
                 io.Image.Input("cropped_images", tooltip="Processed cropped frames."),
                 io.Image.Input("original_images", tooltip="Original frames to paste into."),
-                io.BoundingBox.Input("bboxes", force_input=True,
-                                     tooltip="Boxes from Subject Crop, one per frame. A single box or single frame is applied to every frame; extra boxes within a frame are ignored. When inputs disagree on frame count, extra frames are dropped."),
+                io.BoundingBox.Input("bboxes", force_input=True, optional=True,
+                                     tooltip="Boxes from Subject Crop, one per frame. A single box or single frame is applied to every frame; extra boxes within a frame are ignored. When inputs disagree on frame count, extra frames are dropped. When not connected, the crops are treated as covering the whole frame."),
                 io.Mask.Input("cropped_masks", optional=True,
                               tooltip="Confines the paste to the mask, one per crop at any resolution. A single mask is applied to every frame. Used exactly as given; pre-blur the mask for a soft edge."),
                 io.Int.Input("feather", default=16, min=0,
@@ -520,7 +520,10 @@ class MVEx_SubjectUncropNode(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, cropped_images, original_images, bboxes, feather, cropped_masks=None) -> io.NodeOutput:
+    def execute(cls, cropped_images, original_images, feather, bboxes=None, cropped_masks=None) -> io.NodeOutput:
+        if bboxes is None:
+            bboxes = {"x": 0, "y": 0,
+                      "width": original_images.shape[2], "height": original_images.shape[1]}
         if isinstance(bboxes, dict):
             frames = None
         elif isinstance(bboxes, list) and bboxes and all(isinstance(f, list) and f for f in bboxes):
