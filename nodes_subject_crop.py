@@ -82,15 +82,19 @@ def _open_reconstruct(masks, value_thresh, radius, min_frames):
     return keep[labels]
 
 
-def _resize_image(img_hwc, w, h, method="lanczos"):
+def _resize_image(img_hwc, w, h, method="auto"):
     if img_hwc.shape[0] == h and img_hwc.shape[1] == w:
         return img_hwc
+    if method == "auto":
+        # only lanczos and area antialias here, and lanczos rounds through
+        # uint8, so it is worth its precision only when shrinking
+        method = "lanczos" if w * h < img_hwc.shape[1] * img_hwc.shape[0] else "bicubic"
     return comfy.utils.common_upscale(
         img_hwc.movedim(-1, 0).unsqueeze(0), w, h, method, "disabled"
     ).squeeze(0).movedim(0, -1)
 
 
-def _resize_mask(mask_hw, w, h, method="bilinear"):
+def _resize_mask(mask_hw, w, h, method="nearest-exact"):
     if mask_hw.shape[0] == h and mask_hw.shape[1] == w:
         return mask_hw
     return comfy.utils.common_upscale(
@@ -207,7 +211,8 @@ def _debug_summary(binary, boxes, scale, sel, info, output_size):
 
 
 def _plan_and_crop(original_images, masks, sel, p, divisible_by,
-                   mask_threshold, upscale_megapixels=0.0):
+                   mask_threshold, upscale_megapixels=0.0,
+                   resize_method="auto"):
     if original_images.shape[0] != masks.shape[0]:
         raise ValueError(f"original_images ({original_images.shape[0]}) and masks ({masks.shape[0]}) must have the same frame count")
     if original_images.shape[1:3] != masks.shape[1:3]:
@@ -231,7 +236,6 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
     bw = max(b["width"] for b in boxes)
     bh = max(b["height"] for b in boxes)
     size = None
-    img_method, mask_method = "lanczos", "bilinear"
     if sel == "zoomed" and not full_frame:
         # Target sized to the largest planned box: that stretch is ~1:1
         # and everything else upscales rather than losing detail.
@@ -247,7 +251,6 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
         up = _upscale_size(*(size or (bw, bh)), upscale_megapixels, divisible_by)
         if up is not None:
             size = up
-            img_method, mask_method = "bicubic", "nearest-exact"
 
     debug = _debug_summary(binary, boxes, p["crop_scale"],
                            f"{sel} (full frame)" if full_frame else sel,
@@ -256,11 +259,11 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
     if size is not None:
         tw, th = size
         cropped_images = torch.stack([
-            _resize_image(original_images[i, b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"], :], tw, th, img_method)
+            _resize_image(original_images[i, b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"], :], tw, th, resize_method)
             for i, b in enumerate(boxes)
         ])
         cropped_masks = torch.stack([
-            _resize_mask(masks[i, b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"]], tw, th, mask_method)
+            _resize_mask(masks[i, b["y"]:b["y"] + b["height"], b["x"]:b["x"] + b["width"]], tw, th)
             for i, b in enumerate(boxes)
         ])
     else:
@@ -278,7 +281,15 @@ def _plan_and_crop(original_images, masks, sel, p, divisible_by,
 
 _UPSCALE_MEGAPIXELS = io.Float.Input(
     "upscale_megapixels", default=0.0, min=-16.0, max=16.0, step=0.05,
-    tooltip="Upscale the cropped images/masks to this many megapixels, on the divisible_by grid, using bicubic for images and nearest exact for masks. Set to 0.0 to disable. (Use a negative value to allow scaling down as well as up.)")
+    tooltip="Upscale the cropped images/masks to this many megapixels, on the divisible_by grid. Set to 0.0 to disable. (Use a negative value to allow scaling down as well as up.)")
+
+
+_RESIZE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"]
+
+
+_RESIZE_METHOD = io.Combo.Input(
+    "resize_method", options=["auto"] + _RESIZE_METHODS, default="auto",
+    tooltip="Resampling filter used when a crop is resized (masks are unaffected). auto uses bicubic to enlarge and lanczos to shrink.")
 
 
 _OUTPUTS = [
@@ -393,12 +404,13 @@ class MVEx_SubjectCropNode(io.ComfyNode):
                 io.Int.Input("divisible_by", default=16, min=1,
                              tooltip="Crop width and height are rounded up to a multiple of this. Match the model's resolution requirement."),
                 _UPSCALE_MEGAPIXELS,
+                _RESIZE_METHOD,
             ],
             outputs=_OUTPUTS,
         )
 
     @classmethod
-    def execute(cls, original_images, masks, mode, divisible_by, upscale_megapixels=0.0) -> io.NodeOutput:
+    def execute(cls, original_images, masks, mode, divisible_by, upscale_megapixels=0.0, resize_method="auto") -> io.NodeOutput:
         # extents count pixels at least 10% present: feathered edges stay
         # in the box, a blur's numerically-nonzero tail does not
         sel = mode["mode"]
@@ -408,7 +420,8 @@ class MVEx_SubjectCropNode(io.ComfyNode):
         else:
             p = _cell_params(mode)
         return _plan_and_crop(original_images, masks, sel, p,
-                              divisible_by, 0.1, upscale_megapixels)
+                              divisible_by, 0.1, upscale_megapixels,
+                              resize_method)
 
 
 class MVEx_SubjectCropAdvancedNode(io.ComfyNode):
@@ -481,18 +494,20 @@ class MVEx_SubjectCropAdvancedNode(io.ComfyNode):
                 io.Int.Input("divisible_by", default=16, min=1,
                              tooltip="Crop width and height are rounded up to a multiple of this."),
                 _UPSCALE_MEGAPIXELS,
+                _RESIZE_METHOD,
             ],
             outputs=_OUTPUTS,
         )
 
     @classmethod
-    def execute(cls, original_images, masks, mode, mask_threshold, divisible_by, upscale_megapixels=0.0) -> io.NodeOutput:
+    def execute(cls, original_images, masks, mode, mask_threshold, divisible_by, upscale_megapixels=0.0, resize_method="auto") -> io.NodeOutput:
         p = dict(mode)
         for key, val in (("resize_cost", 2.0), ("zoom_step", 1.0),
                          ("max_zoom_rate", 0.0)):
             p.setdefault(key, val)
         return _plan_and_crop(original_images, masks, mode["mode"], p,
-                              divisible_by, mask_threshold, upscale_megapixels)
+                              divisible_by, mask_threshold, upscale_megapixels,
+                              resize_method)
 
 
 class MVEx_SubjectUncropNode(io.ComfyNode):
@@ -515,12 +530,13 @@ class MVEx_SubjectUncropNode(io.ComfyNode):
                               tooltip="Confines the paste to the mask, one per crop at any resolution. A single mask is applied to every frame. Used exactly as given; pre-blur the mask for a soft edge."),
                 io.Int.Input("feather", default=16, min=0,
                              tooltip="Blend width in pixels, feathered inward from the crop border. Sides touching the image edge are not feathered."),
+                _RESIZE_METHOD,
             ],
             outputs=[io.Image.Output(display_name="images", tooltip="Original frames with the crops blended back in.")],
         )
 
     @classmethod
-    def execute(cls, cropped_images, original_images, feather, bboxes=None, cropped_masks=None) -> io.NodeOutput:
+    def execute(cls, cropped_images, original_images, feather, resize_method="auto", bboxes=None, cropped_masks=None) -> io.NodeOutput:
         if bboxes is None:
             bboxes = {"x": 0, "y": 0,
                       "width": original_images.shape[2], "height": original_images.shape[1]}
@@ -559,7 +575,7 @@ class MVEx_SubjectUncropNode(io.ComfyNode):
             x, y, w, h = (int(round(b[k])) for k in ("x", "y", "width", "height"))
             # a crop resampled anywhere along the way (Subject Crop's
             # upscale_megapixels, zoomed mode, or a resize node) scales back here
-            crop = _resize_image(cropped_images[i], w, h)
+            crop = _resize_image(cropped_images[i], w, h, resize_method)
 
             alpha = torch.ones(h, w, dtype=out.dtype, device=out.device)
             fx, fy = min(feather, w // 2), min(feather, h // 2)

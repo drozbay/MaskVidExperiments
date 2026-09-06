@@ -76,6 +76,8 @@ stillness or tightness pays for it, and the `debug` output summarizes what
 the planner chose. `upscale_megapixels` upscales every crop to about that
 many pixels on the `divisible_by` grid, keeping the shape the planner
 chose and never downscaling, so no resize node is needed on either side.
+`resize_method` picks the filter used whenever a crop is resampled, and
+its `auto` setting uses bicubic to enlarge and lanczos to shrink.
 Setting `crop_scale` to 0 skips cropping entirely: the whole frame passes
 through, still sized to the `divisible_by` grid and the
 `upscale_megapixels` floor, so the rest of the workflow works unchanged
@@ -89,7 +91,8 @@ Pastes processed crops back into the original frames with a feathered
 border, optionally confined by the cropped masks. The paste is pixel-exact
 when the crop size was not changed, and crops that were resampled along
 the way (zoomed mode, `upscale_megapixels`, or a resize node in between)
-are scaled back to their box automatically. The input order is
+are scaled back to their box automatically, with `resize_method` picking
+the filter for that scale-back. The input order is
 bypass-correct: bypassing both Subject Crop and Subject Uncrop passes the
 processed frames straight through, so the whole crop pipeline can be A/B'd
 with two clicks.
